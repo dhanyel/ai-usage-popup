@@ -6,3 +6,6 @@ docs/superpowers/
 
 __pycache__/
 *.pyc
+
+# Python
+.venv/

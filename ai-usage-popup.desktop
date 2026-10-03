@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=AI Usage Popup
-Comment=Usage popup for Claude, Codex, Z.AI and OpenRouter
-Exec=/home/dhanyel/.local/bin/ai-usage-popup
+Comment=Usage of Claude, Codex, Z.AI, OpenRouter, DeepSeek and Kimi plans
+Exec=ai-usage-popup
 Terminal=false
 Type=Application
 Categories=Utility;Development;

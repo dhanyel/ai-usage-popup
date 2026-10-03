@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK and PyGObject
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-gi gir1.2-gtk-3.0 xvfb
+      - name: Syntax
+        run: python3 -m py_compile ai-usage-popup test_zai.py
+      - name: Tests
+        run: xvfb-run -a python3 -m unittest -v
+      - name: Installer
+        run: |
+          bash -n install.sh
+          PREFIX="$RUNNER_TEMP/prefix" ./install.sh
+          test -x "$RUNNER_TEMP/prefix/bin/ai-usage-popup"
+          PREFIX="$RUNNER_TEMP/prefix" ./install.sh --uninstall
