@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- tile -->
+  <rect x="6" y="6" width="244" height="244" rx="58" fill="#12151c"/>
+  <rect x="10" y="10" width="236" height="236" rx="54" fill="#1a1e27" stroke="#3a4152" stroke-width="6"/>
+
+  <!-- medidor 1: âmbar 2/4 -->
+  <g>
+    <rect x="44" y="62" width="38" height="30" rx="9" fill="#e5c07b"/>
+    <rect x="88" y="62" width="38" height="30" rx="9" fill="#ebce98"/>
+    <rect x="132" y="62" width="38" height="30" rx="9" fill="#2e3442"/>
+    <rect x="176" y="62" width="38" height="30" rx="9" fill="#2e3442"/>
+  </g>
+
+  <!-- medidor 2: verde 1/4 -->
+  <g>
+    <rect x="44" y="112" width="38" height="30" rx="9" fill="#98c379"/>
+    <rect x="88" y="112" width="38" height="30" rx="9" fill="#2e3442"/>
+    <rect x="132" y="112" width="38" height="30" rx="9" fill="#2e3442"/>
+    <rect x="176" y="112" width="38" height="30" rx="9" fill="#2e3442"/>
+  </g>
+
+  <!-- medidor 3: azul 3/4 -->
+  <g>
+    <rect x="44" y="162" width="38" height="30" rx="9" fill="#61afef"/>
+    <rect x="88" y="162" width="38" height="30" rx="9" fill="#61afef"/>
+    <rect x="132" y="162" width="38" height="30" rx="9" fill="#a9d2f7"/>
+    <rect x="176" y="162" width="38" height="30" rx="9" fill="#2e3442"/>
+  </g>
+</svg>

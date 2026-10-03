@@ -1,0 +1,8 @@
+# Spec, plano, reviews e descrições de MR ficam LOCAIS — nunca versionados.
+docs/superpowers/
+
+# Permissões locais do Claude Code
+.claude/settings.local.json
+
+__pycache__/
+*.pyc

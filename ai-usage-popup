@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+"""Popup GTK com o uso dos vendors de IA (via ai-usagebar)."""
+import json
+import re
+import shutil
+import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, Gdk, GLib, Pango
+
+VENDORS = [
+    ("anthropic", "Claude"),
+    ("openai", "Codex"),
+    ("zai", "Z.AI"),
+    ("openrouter", "OpenRouter"),
+    ("deepseek", "DeepSeek"),
+    ("kimi", "Kimi"),
+]
+AI = shutil.which("ai-usagebar") or str(Path.home() / ".local/bin/ai-usagebar")
+
+# Faixas de uso → classe de cor (verde → âmbar → laranja → vermelho)
+def klass_of(pct):
+    if pct < 40:
+        return 'low'
+    if pct < 70:
+        return 'mid'
+    if pct < 90:
+        return 'high'
+    return 'critical'
+
+
+LABELS_PT = [('Fable weekly', 'Fable semanal'), ('Weekly', 'Semanal'),
+             ('weekly', 'semanal'), ('Session', 'Sessão')]
+
+CSS = b"""
+window.ai-window { background-color: #12151c; }
+
+headerbar.ai-header {
+    background-color: #171b24;
+    background-image: none;
+    border-bottom: 1px solid #2a2f3b;
+    box-shadow: none;
+    padding: 4px 8px;
+    min-height: 52px;
+}
+.app-glyph {
+    background-color: rgba(97,175,239,0.12);
+    border: 1px solid rgba(97,175,239,0.28);
+    border-radius: 8px;
+    color: #61afef;
+    font-family: monospace;
+    font-weight: bold;
+    font-size: 13px;
+}
+.win-title { color: #e9ecf2; font-weight: bold; font-size: 14px; }
+.win-sub { color: #8b93a7; font-family: monospace; font-size: 11px; }
+
+button.refresh {
+    background-color: #222735;
+    background-image: none;
+    border: 1px solid #333a4b;
+    border-radius: 8px;
+    color: #e9ecf2;
+    font-weight: bold;
+    font-size: 12px;
+    padding: 4px 12px;
+    box-shadow: none;
+    text-shadow: none;
+}
+button.refresh:hover { background-color: #2a3040; border-color: #40495e; }
+button.refresh:disabled { color: #5c6472; }
+
+.card {
+    background-color: #1a1e27;
+    border: 1px solid #232833;
+    border-radius: 12px;
+    padding: 16px;
+}
+.vendor { color: #e9ecf2; font-weight: bold; font-size: 15px; }
+.pill {
+    color: #8b93a7;
+    border: 1px solid #2a2f3b;
+    border-radius: 99px;
+    padding: 2px 9px;
+    font-family: monospace;
+    font-size: 10px;
+}
+.badge {
+    border-radius: 99px;
+    padding: 3px 10px;
+}
+.badge label { font-family: monospace; font-weight: bold; font-size: 10px; letter-spacing: 1px; }
+.badge.low { background-color: rgba(152,195,121,0.1); }
+.badge.low label, .badge.low .dot { color: #98c379; }
+.badge.mid { background-color: rgba(229,192,123,0.1); }
+.badge.mid label, .badge.mid .dot { color: #e5c07b; }
+.badge.high { background-color: rgba(255,138,92,0.1); }
+.badge.high label, .badge.high .dot { color: #ff8a5c; }
+.badge.critical { background-color: rgba(239,83,80,0.1); }
+.badge.critical label, .badge.critical .dot { color: #ef5350; }
+.badge.unknown { background-color: rgba(139,147,167,0.1); }
+.badge.unknown label, .badge.unknown .dot { color: #8b93a7; }
+.dot.low { background-color: #98c379; }
+.dot.mid { background-color: #e5c07b; }
+.dot.high { background-color: #ff8a5c; }
+.dot.critical { background-color: #ef5350; }
+.dot.unknown { background-color: #8b93a7; }
+.dot { border-radius: 99px; }
+
+.hero-num { color: #e9ecf2; font-family: monospace; font-weight: bold; font-size: 38px; }
+.hero-pct { color: #8b93a7; font-family: monospace; font-weight: bold; font-size: 22px; }
+.hero-ctx { color: #8b93a7; font-family: monospace; font-size: 12px; }
+
+.meter-name { color: #8b93a7; font-size: 12px; }
+.meter-trend { color: #5c6472; font-family: monospace; font-size: 11px; }
+.meter-val { color: #e9ecf2; font-family: monospace; font-weight: bold; font-size: 12px; }
+.meter-reset { color: #5c6472; font-family: monospace; font-size: 10px; }
+
+.cell { background-color: #2a3040; border-radius: 3px; min-height: 9px; min-width: 6px; }
+.cell.on.low { background-color: #98c379; }
+.cell.on.mid { background-color: #e5c07b; }
+.cell.on.high { background-color: #ff8a5c; }
+.cell.on.critical { background-color: #ef5350; }
+.cell.tip.low { background-color: #afd096; }
+.cell.tip.mid { background-color: #ebce98; }
+.cell.tip.high { background-color: #ffa480; }
+.cell.tip.critical { background-color: #f27977; }
+
+.card-foot {
+    border-top: 1px solid #232833;
+    padding-top: 10px;
+}
+.card-foot label { color: #5c6472; font-family: monospace; font-size: 11px; }
+
+.section-label { color: #5c6472; font-weight: bold; font-size: 10px; letter-spacing: 2px; }
+.section-count { color: #8b93a7; font-family: monospace; font-size: 10px; }
+separator.section-rule { background-color: #232833; min-height: 1px; }
+
+.off-row {
+    background-color: rgba(26,30,39,0.5);
+    border: 1px solid #232833;
+    border-radius: 10px;
+    padding: 8px 14px;
+}
+.off-name { color: #8b93a7; font-weight: bold; font-size: 13px; }
+.off-why { color: #5c6472; font-size: 12px; }
+.off-fix {
+    color: #8b93a7;
+    background-color: #232834;
+    border: 1px solid #2a2f3b;
+    border-radius: 6px;
+    padding: 2px 8px;
+    font-family: monospace;
+    font-size: 10px;
+}
+"""
+
+
+def strip_markup(text: str) -> str:
+    """Remove spans/tags e a moldura do tooltip, preservando as barras."""
+    text = re.sub(r"<[^>]+>", "", text)
+    for ch in "╭╮╰╯":
+        text = text.replace(ch, "")
+    text = text.replace("│", " ")
+    text = re.sub(r"─{2,}", "", text)
+    # glifos de ícone (nerd fonts / PUA) e relógio
+    text = re.sub(r"[-\U000f0000-\U000fffff⏱]", "", text)
+    lines = []
+    for line in text.splitlines():
+        line = " ".join(line.split()).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def to_pt(label: str) -> str:
+    for en, pt in LABELS_PT:
+        label = label.replace(en, pt)
+    return label
+
+
+def parse_tooltip(tooltip: str, vendor_label: str):
+    """Extrai plano, medidores (nome, %, tendência, reset), extras e horário."""
+    lines = strip_markup(tooltip).splitlines()
+    info = {'plan': '', 'meters': [], 'extras': [], 'updated': ''}
+    if lines:
+        title = lines[0]
+        info['plan'] = title[len(vendor_label):].strip() if title.startswith(vendor_label) else title
+
+    prev_label = ''
+    for line in lines[1:]:
+        m_up = re.search(r"Updated\s+(\S+)", line)
+        if m_up:
+            info['updated'] = m_up.group(1)
+            continue
+        m_reset = re.search(r"Resets in\s+(.+)", line)
+        if m_reset:
+            if info['meters']:
+                info['meters'][-1]['reset'] = m_reset.group(1).strip()
+            continue
+        is_bar = '%' in line and ('█' in line or '░' in line)
+        if is_bar:
+            m_pct = re.search(r"(\d+)%", line)
+            if m_pct:
+                info['meters'].append({
+                    'name': to_pt(prev_label) or f'Uso {len(info["meters"]) + 1}',
+                    'pct': int(m_pct.group(1)),
+                    'trend': '↓' if '↓' in line else ('↑' if '↑' in line else ''),
+                    'reset': '',
+                })
+            prev_label = ''
+            continue
+        if '█' in line or '░' in line:
+            continue
+        prev_label = line
+
+    # linhas soltas (créditos etc.) viram rodapé; o label pendente entra junto
+    for line in lines[1:]:
+        if re.search(r"balance:|messages", line):
+            if 'Credits' not in info['extras'] and any('Credits' in l for l in lines):
+                info['extras'].append('Credits')
+            info['extras'].append(line)
+    return info
+
+
+def run_vendor(vendor: str):
+    try:
+        out = subprocess.check_output([AI, '--vendor', vendor, '--json'],
+                                      text=True, stderr=subprocess.DEVNULL, timeout=20)
+        data = json.loads(out)
+        return {
+            'text': strip_markup(str(data.get('text', ''))),
+            'tooltip': str(data.get('tooltip', '')),
+            'class': data.get('class', '?'),
+        }
+    except Exception as e:
+        return {'text': 'indisponível', 'tooltip': str(e), 'class': 'critical'}
+
+
+def is_bad(data):
+    txt = (data.get('text') or '').lower()
+    tip = strip_markup(data.get('tooltip') or '').lower()
+    return ('no api key' in tip or 'no usable cache' in tip or 'credentials error' in tip
+            or txt in ('⚠', 'indisponível', 'erro'))
+
+
+def offline_reason(vendor, data):
+    tip = strip_markup(data.get('tooltip') or '').lower()
+    if 'no usable cache' in tip:
+        return 'cache indisponível — rode o vendor uma vez para popular', f'ai-usagebar --vendor {vendor}'
+    if 'no api key' in tip or 'credentials error' in tip:
+        return 'sem API key', f'[{vendor}] api_key'
+    first = strip_markup(data.get('tooltip') or data.get('text') or 'indisponível').splitlines()
+    return (first[0] if first else 'indisponível'), 'config.toml'
+
+
+def esc(text):
+    return GLib.markup_escape_text(str(text))
+
+
+class UsageWindow(Gtk.Window):
+    def __init__(self):
+        super().__init__(title='AI Usage')
+        self.set_default_size(940, 640)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_icon_name('ai-usage-popup')
+        self.get_style_context().add_class('ai-window')
+
+        Gtk.Settings.get_default().set_property('gtk-application-prefer-dark-theme', True)
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        self._build_header()
+
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.add(scroller)
+
+        self.body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        self.body.set_border_width(18)
+        scroller.add(self.body)
+
+        self.refresh()
+
+    # ── construção ─────────────────────────────────────────────
+    def _build_header(self):
+        header = Gtk.HeaderBar()
+        header.set_show_close_button(True)
+        header.get_style_context().add_class('ai-header')
+        self.set_titlebar(header)
+
+        title_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        glyph = Gtk.Label(label='ai')
+        glyph.set_size_request(30, 30)
+        glyph.get_style_context().add_class('app-glyph')
+        title_box.pack_start(glyph, False, False, 0)
+
+        titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        title = Gtk.Label(label='AI Usage')
+        title.set_xalign(0)
+        title.get_style_context().add_class('win-title')
+        self.subtitle = Gtk.Label(label='carregando…')
+        self.subtitle.set_xalign(0)
+        self.subtitle.get_style_context().add_class('win-sub')
+        titles.pack_start(title, False, False, 0)
+        titles.pack_start(self.subtitle, False, False, 0)
+        title_box.pack_start(titles, False, False, 0)
+
+        header.set_custom_title(None)
+        header.pack_start(title_box)
+
+        self.refresh_btn = Gtk.Button.new_with_label('↻ Atualizar')
+        self.refresh_btn.get_style_context().add_class('refresh')
+        self.refresh_btn.connect('clicked', lambda _b: self.refresh())
+        header.pack_end(self.refresh_btn)
+
+    def _badge(self, klass):
+        if klass not in ('low', 'mid', 'high', 'critical'):
+            klass = 'unknown'
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box.set_valign(Gtk.Align.CENTER)
+        ctx = box.get_style_context()
+        ctx.add_class('badge')
+        ctx.add_class(klass)
+        dot = Gtk.Box()
+        dot.set_size_request(7, 7)
+        dot.set_valign(Gtk.Align.CENTER)
+        for c in ('dot', klass):
+            dot.get_style_context().add_class(c)
+        box.pack_start(dot, False, False, 0)
+        box.pack_start(Gtk.Label(label=klass.upper()), False, False, 0)
+        return box
+
+    def _cells(self, pct):
+        klass = klass_of(pct)
+        on = round(max(0, min(100, pct)) / 5)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        row.set_homogeneous(True)
+        for i in range(20):
+            cell = Gtk.Box()
+            ctx = cell.get_style_context()
+            ctx.add_class('cell')
+            if i < on:
+                ctx.add_class('tip' if i == on - 1 else 'on')
+                ctx.add_class(klass)
+            row.pack_start(cell, True, True, 0)
+        return row
+
+    def _meter_row(self, meter):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+
+        name = Gtk.Label(label=meter['name'])
+        name.set_xalign(0)
+        name.get_style_context().add_class('meter-name')
+        top.pack_start(name, False, False, 0)
+
+        if meter['trend']:
+            trend = Gtk.Label(label=meter['trend'])
+            trend.get_style_context().add_class('meter-trend')
+            top.pack_start(trend, False, False, 0)
+
+        reset = Gtk.Label(label=f"⟳ {meter['reset'] or '—'}")
+        reset.get_style_context().add_class('meter-reset')
+        top.pack_end(reset, False, False, 0)
+
+        val = Gtk.Label(label=f"{meter['pct']}%")
+        val.get_style_context().add_class('meter-val')
+        top.pack_end(val, False, False, 0)
+
+        box.pack_start(top, False, False, 0)
+        box.pack_start(self._cells(meter['pct']), False, False, 0)
+        return box
+
+    def make_card(self, label, data):
+        info = parse_tooltip(data.get('tooltip', ''), label)
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        card.get_style_context().add_class('card')
+        card.set_hexpand(True)
+
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        vendor = Gtk.Label(label=label)
+        vendor.get_style_context().add_class('vendor')
+        head.pack_start(vendor, False, False, 0)
+        if info['plan']:
+            pill = Gtk.Label(label=info['plan'])
+            pill.set_valign(Gtk.Align.CENTER)
+            pill.get_style_context().add_class('pill')
+            head.pack_start(pill, False, False, 0)
+        head.pack_end(self._badge(data.get('class', '?')), False, False, 0)
+        card.pack_start(head, False, False, 0)
+
+        if info['meters']:
+            first = info['meters'][0]
+            hero = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            num = Gtk.Label()
+            num.set_markup(f"<span size='31000' weight='bold'>{first['pct']}</span>"
+                           f"<span size='18000' weight='bold' foreground='#8b93a7'>%</span>")
+            num.get_style_context().add_class('hero-num')
+            num.set_valign(Gtk.Align.BASELINE)
+            hero.pack_start(num, False, False, 0)
+
+            ctx_lbl = Gtk.Label()
+            ctx_lbl.set_markup(f"{esc(first['name'])} · reseta em "
+                               f"<span foreground='#e9ecf2' weight='bold'>{esc(first['reset'] or '—')}</span>")
+            ctx_lbl.get_style_context().add_class('hero-ctx')
+            ctx_lbl.set_valign(Gtk.Align.BASELINE)
+            hero.pack_start(ctx_lbl, False, False, 0)
+            card.pack_start(hero, False, False, 0)
+
+            meters = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            for meter in info['meters']:
+                meters.pack_start(self._meter_row(meter), False, False, 0)
+            card.pack_start(meters, False, False, 0)
+        else:
+            fallback = Gtk.Label(label=data.get('text', 'sem dados'))
+            fallback.set_xalign(0)
+            fallback.get_style_context().add_class('hero-ctx')
+            card.pack_start(fallback, False, False, 0)
+
+        if info['extras']:
+            foot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+            foot.get_style_context().add_class('card-foot')
+            foot_lbl = Gtk.Label(label=' · '.join(info['extras'][:4]))
+            foot_lbl.set_xalign(0)
+            foot_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+            foot.pack_start(foot_lbl, True, True, 0)
+            card.pack_start(foot, False, False, 0)
+        return card
+
+    def make_offline_row(self, vendor, label, data):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        row.get_style_context().add_class('off-row')
+
+        dot = Gtk.Box()
+        dot.set_size_request(7, 7)
+        dot.set_valign(Gtk.Align.CENTER)
+        for c in ('dot', 'unknown'):
+            dot.get_style_context().add_class(c)
+        row.pack_start(dot, False, False, 0)
+
+        name = Gtk.Label(label=label)
+        name.set_xalign(0)
+        name.set_size_request(96, -1)
+        name.get_style_context().add_class('off-name')
+        row.pack_start(name, False, False, 0)
+
+        why_text, fix_text = offline_reason(vendor, data)
+        why = Gtk.Label(label=why_text)
+        why.set_xalign(0)
+        why.set_ellipsize(Pango.EllipsizeMode.END)
+        why.get_style_context().add_class('off-why')
+        row.pack_start(why, True, True, 0)
+
+        fix = Gtk.Label(label=fix_text)
+        fix.set_valign(Gtk.Align.CENTER)
+        fix.get_style_context().add_class('off-fix')
+        row.pack_end(fix, False, False, 0)
+        return row
+
+    def _section_label(self, text, count):
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        lbl = Gtk.Label(label=text.upper())
+        lbl.get_style_context().add_class('section-label')
+        box.pack_start(lbl, False, False, 0)
+        cnt = Gtk.Label(label=str(count))
+        cnt.get_style_context().add_class('section-count')
+        box.pack_start(cnt, False, False, 0)
+        rule = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        rule.set_valign(Gtk.Align.CENTER)
+        rule.get_style_context().add_class('section-rule')
+        box.pack_start(rule, True, True, 0)
+        return box
+
+    # ── dados ──────────────────────────────────────────────────
+    def refresh(self):
+        self.refresh_btn.set_sensitive(False)
+        self.subtitle.set_text('atualizando…')
+
+        def worker():
+            with ThreadPoolExecutor(max_workers=len(VENDORS)) as pool:
+                results = list(pool.map(lambda v: (v[0], v[1], run_vendor(v[0])), VENDORS))
+            GLib.idle_add(self.render, results)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def render(self, results):
+        for child in self.body.get_children():
+            self.body.remove(child)
+
+        goods = [(v, l, d) for v, l, d in results if not is_bad(d)]
+        bads = [(v, l, d) for v, l, d in results if is_bad(d)]
+
+        grid = Gtk.Grid()
+        grid.set_row_spacing(14)
+        grid.set_column_spacing(14)
+        grid.set_column_homogeneous(True)
+        for i, (_v, label, data) in enumerate(goods):
+            grid.attach(self.make_card(label, data), i % 2, i // 2, 1, 1)
+        self.body.pack_start(grid, False, False, 0)
+
+        if bads:
+            self.body.pack_start(self._section_label('Sem configuração', len(bads)), False, False, 0)
+            off_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            for vendor, label, data in bads:
+                off_box.pack_start(self.make_offline_row(vendor, label, data), False, False, 0)
+            self.body.pack_start(off_box, False, False, 0)
+
+        updated = ''
+        for _v, _l, data in goods:
+            info = parse_tooltip(data.get('tooltip', ''), _l)
+            updated = info['updated'] or updated
+        parts = [f'{len(results)} vendors']
+        if updated:
+            parts.insert(0, f'atualizado às {updated}')
+        self.subtitle.set_text(' · '.join(parts))
+
+        self.refresh_btn.set_sensitive(True)
+        self.body.show_all()
+        return False
+
+
+if __name__ == '__main__':
+    win = UsageWindow()
+    win.connect('destroy', Gtk.main_quit)
+    win.show_all()
+    Gtk.main()
