@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Popup GTK com o uso dos vendors de IA (via ai-usagebar)."""
+"""Popup GTK com o uso dos vendors de IA (via ai-usagebar, e via API no caso do Z.AI)."""
 import json
+import os
 import re
 import shutil
 import subprocess
 import threading
+import time
+import tomllib
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -21,6 +26,21 @@ VENDORS = [
     ("kimi", "Kimi"),
 ]
 AI = shutil.which("ai-usagebar") or str(Path.home() / ".local/bin/ai-usagebar")
+
+# O Z.AI não passa pelo ai-usagebar: o plano Lite reporta janelas do tipo CREDIT_LIMIT, e o binário
+# só mapeia TIME_LIMIT/TOKENS_LIMIT — o card ficava em "0% · —" com os dados existindo na API.
+ZAI_URL = 'https://api.z.ai/api/monitor/usage/quota/limit'
+ZAI_CONFIG = Path.home() / '.config/ai-usagebar/config.toml'
+ZAI_TIMEOUT = 15
+# `unit` da API → (segundos por unidade, rótulo, rótulo quando number == 1). Confirmado pelos resets
+# em 04/09/2026: unit 3 resetava em ~4h (janela de 5 horas) e unit 6 em 7 dias (semanal).
+# Os segundos existem para ORDENAR por duração: ordenar por horário de reset parece equivalente e
+# não é — nas horas que antecedem o reset semanal, a semanal reseta antes da janela de 5h e roubaria
+# o número-herói, escondendo justamente a janela que está estrangulando o uso.
+ZAI_UNITS = {
+    3: (3600, 'Sessão {n}h', 'Sessão 1h'),
+    6: (604800, '{n} semanas', 'Semanal'),
+}
 
 # Faixas de uso → classe de cor (verde → âmbar → laranja → vermelho)
 def klass_of(pct):
@@ -227,7 +247,177 @@ def parse_tooltip(tooltip: str, vendor_label: str):
     return info
 
 
+def fmt_pct(value):
+    """Percentual para exibição: uma casa (com vírgula) abaixo de 10%, inteiro daí para cima.
+
+    Abaixo de 10% a casa decimal informa — 0,4% e 2,2% viram ambos "2%" se arredondados. Acima
+    disso ela só polui, e os outros vendors sempre mostraram inteiro.
+    """
+    # arredonda ANTES de decidir: 9,96 vira "10,0" com uma casa, quebrando a própria regra
+    arredondado = round(value, 1)
+    if arredondado >= 10 or arredondado == int(arredondado):
+        return str(int(round(value)))
+    return f'{arredondado:.1f}'.replace('.', ',')
+
+
+def fmt_delta(ms_epoch):
+    """Quanto falta até `ms_epoch` (milissegundos), no padrão dos outros cards: `2d 17h`, `4h 31m`."""
+    if not isinstance(ms_epoch, (int, float)) or isinstance(ms_epoch, bool):
+        return '—'
+    secs = int(ms_epoch / 1000 - time.time())
+    if secs <= 0:
+        return 'agora'
+    days, rest = divmod(secs, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return f'{days}d {hours}h'
+    if hours:
+        return f'{hours}h {minutes}m'
+    return f'{minutes}m'
+
+
+def zai_api_key():
+    """Chave do Z.AI: o config.toml do ai-usagebar primeiro, a env depois.
+
+    Mesma fonte que o ai-usagebar usa — nada de um terceiro lugar para atualizar. O config.toml
+    serve o popup lançado pelo .desktop, que não enxerga o que o .bashrc exporta.
+    """
+    try:
+        with ZAI_CONFIG.open('rb') as fh:
+            secao = tomllib.load(fh).get('zai')
+        # `zai = "chave"` em vez de `[zai]` é erro de digitação plausível: não pode virar exceção
+        key = secao.get('api_key', '') if isinstance(secao, dict) else ''
+        if key:
+            return key
+    except (OSError, tomllib.TOMLDecodeError):
+        pass
+    return os.environ.get('ZAI_API_KEY', '')
+
+
+def zai_window_label(limit):
+    """Rótulo do medidor a partir de unit/number.
+
+    Unidade desconhecida devolve rótulo degradado em vez de sumir: plano novo mudando `unit` não
+    pode virar card vazio em silêncio.
+    """
+    unit = limit.get('unit')
+    number = limit.get('number', 0)
+    if unit in ZAI_UNITS:
+        _, plural, singular = ZAI_UNITS[unit]
+        return singular if number == 1 else plural.format(n=number)
+    return f'Janela {number}·u{unit}'
+
+
+def zai_window_seconds(limit):
+    """Duração da janela em segundos — o critério de ordenação.
+
+    Unidade desconhecida vai para o fim em vez de disputar o número-herói com duração inventada.
+    """
+    unit = limit.get('unit')
+    number = limit.get('number', 0)
+    if unit in ZAI_UNITS and isinstance(number, (int, float)):
+        return ZAI_UNITS[unit][0] * number
+    return float('inf')
+
+
+def zai_error(reason):
+    """Contrato único de erro do Z.AI — o mesmo para as cinco classes de falha.
+
+    `text` é o que is_bad() reconhece, então nenhuma falha vira card com número falso; `reason` e
+    `fix` são lidos por offline_reason() para a linha de "sem configuração".
+    """
+    return {'text': 'indisponível', 'tooltip': reason, 'class': 'critical',
+            'reason': reason, 'fix': '[zai] api_key'}
+
+
+def zai_info(payload):
+    """Traduz a resposta da API do Z.AI para o formato que parse_tooltip() produz. Função pura."""
+    if not isinstance(payload, dict):
+        raise ValueError('resposta não é um objeto JSON')
+    if not payload.get('success'):
+        raise ValueError(f"API recusou: {payload.get('msg') or 'sem motivo'}")
+    # cada checagem vem ANTES do acesso que ela protege: validar depois de usar não protege nada
+    data = payload.get('data') or {}
+    if not isinstance(data, dict):
+        raise ValueError('resposta sem janelas de uso')
+    limits = data.get('limits') or []
+    if not isinstance(limits, list) or not limits:
+        raise ValueError('resposta sem janelas de uso')
+    # antes do sorted(): a chave de ordenação já acessa cada janela
+    if not all(isinstance(limit, dict) for limit in limits):
+        raise ValueError('janela de uso malformada')
+
+    meters, credits = [], []
+    # ordena por DURAÇÃO da janela, não por horário de reset — ver o comentário em ZAI_UNITS
+    for limit in sorted(limits, key=zai_window_seconds):
+        used, total = limit.get('currentValue'), limit.get('usage')
+        # campo ausente NÃO pode virar 0% verde: é exatamente o número falso que o card não pode ter
+        if used is None or total is None:
+            raise ValueError('resposta sem os campos de uso')
+        used, total = float(used), float(total)
+        if total <= 0:
+            raise ValueError('limite da janela inválido')
+        label = zai_window_label(limit)
+        meters.append({'name': label, 'pct': used / total * 100, 'trend': '',
+                       'reset': fmt_delta(limit.get('nextResetTime'))})
+        credits.append(f'{used:.0f}/{total:.0f} ({label.lower()})')
+
+    level = data.get('level') or ''
+    return {'plan': f'GLM Coding {level.capitalize()}' if level else '',
+            'meters': meters,
+            'extras': [f"créditos {' · '.join(credits)}"] if credits else [],
+            # vazio de propósito: o subtítulo global mostra "o último não-vazio", e carimbar o
+            # relógio local aqui faria o cache velho de outro vendor ser anunciado como recém-lido
+            'updated': ''}
+
+
+def run_zai():
+    """Lê o uso do Z.AI direto da API, contornando o ai-usagebar."""
+    key = zai_api_key()
+    if not key:
+        return zai_error('sem API key')
+
+    req = urllib.request.Request(ZAI_URL, headers={'Authorization': f'Bearer {key}'})
+    try:
+        with urllib.request.urlopen(req, timeout=ZAI_TIMEOUT) as resp:
+            body = resp.read()
+    except urllib.error.HTTPError as e:          # subclasse de URLError: vem primeiro
+        return zai_error(f'HTTP {e.code}')
+    except TimeoutError:
+        return zai_error(f'tempo esgotado ({ZAI_TIMEOUT}s)')
+    except urllib.error.URLError as e:
+        motivo = getattr(e, 'reason', '')
+        if isinstance(motivo, TimeoutError) or 'timed out' in str(motivo).lower():
+            return zai_error(f'tempo esgotado ({ZAI_TIMEOUT}s)')
+        return zai_error('rede indisponível')    # DNS, conexão recusada: diagnóstico diferente
+    except OSError:
+        return zai_error('rede indisponível')
+
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return zai_error('resposta não é JSON')
+
+    try:
+        info = zai_info(payload)
+    except ValueError as e:
+        return zai_error(str(e))
+
+    first = info['meters'][0]
+    return {'text': f"{fmt_pct(first['pct'])}%", 'tooltip': '',
+            'class': klass_of(first['pct']), 'info': info}
+
+
 def run_vendor(vendor: str):
+    if vendor == 'zai':
+        # A guarda genérica é obrigatória aqui: este desvio acontece FORA do try abaixo, e uma
+        # exceção escapando mata a thread do pool — o GLib.idle_add(render) nunca roda e o popup
+        # inteiro congela em "atualizando…", levando os outros cinco vendors junto.
+        try:
+            return run_zai()
+        except Exception as e:
+            return zai_error(f'falha inesperada: {type(e).__name__}')
     try:
         out = subprocess.check_output([AI, '--vendor', vendor, '--json'],
                                       text=True, stderr=subprocess.DEVNULL, timeout=20)
@@ -249,6 +439,10 @@ def is_bad(data):
 
 
 def offline_reason(vendor, data):
+    # Vendor lido direto da API traz motivo e conserto já prontos (contrato de zai_error). Sem esta
+    # ramificação, um timeout cairia no fallback genérico `config.toml` com o texto cru do erro.
+    if data.get('reason'):
+        return data['reason'], data.get('fix') or 'config.toml'
     tip = strip_markup(data.get('tooltip') or '').lower()
     if 'no usable cache' in tip:
         return 'cache indisponível — rode o vendor uma vez para popular', f'ai-usagebar --vendor {vendor}'
@@ -340,6 +534,10 @@ class UsageWindow(Gtk.Window):
     def _cells(self, pct):
         klass = klass_of(pct)
         on = round(max(0, min(100, pct)) / 5)
+        # 1 célula = 5%: sem isto, 2,2% de uso acende zero células e o card parece quebrado.
+        # Usado ≠ não usado, então qualquer uso positivo acende ao menos uma.
+        if pct > 0:
+            on = max(on, 1)
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
         row.set_homogeneous(True)
         for i in range(20):
@@ -370,7 +568,7 @@ class UsageWindow(Gtk.Window):
         reset.get_style_context().add_class('meter-reset')
         top.pack_end(reset, False, False, 0)
 
-        val = Gtk.Label(label=f"{meter['pct']}%")
+        val = Gtk.Label(label=f"{fmt_pct(meter['pct'])}%")
         val.get_style_context().add_class('meter-val')
         top.pack_end(val, False, False, 0)
 
@@ -379,7 +577,8 @@ class UsageWindow(Gtk.Window):
         return box
 
     def make_card(self, label, data):
-        info = parse_tooltip(data.get('tooltip', ''), label)
+        # Vendor lido direto da API já entrega `info` pronto; os demais vêm do tooltip do ai-usagebar.
+        info = data.get('info') or parse_tooltip(data.get('tooltip', ''), label)
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
         card.get_style_context().add_class('card')
         card.set_hexpand(True)
@@ -400,8 +599,12 @@ class UsageWindow(Gtk.Window):
             first = info['meters'][0]
             hero = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
             num = Gtk.Label()
-            num.set_markup(f"<span size='31000' weight='bold'>{first['pct']}</span>"
-                           f"<span size='18000' weight='bold' foreground='#8b93a7'>%</span>")
+            # A casa decimal vai junto do "%", no corpo menor: a vírgula em monospace de 38px abre
+            # um vão que parece defeito de renderização ("2 , 8"). Inteiro grande, resto pequeno.
+            inteiro, _, decimal = fmt_pct(first['pct']).partition(',')
+            sufixo = f',{decimal}%' if decimal else '%'
+            num.set_markup(f"<span size='31000' weight='bold'>{inteiro}</span>"
+                           f"<span size='18000' weight='bold' foreground='#8b93a7'>{sufixo}</span>")
             num.get_style_context().add_class('hero-num')
             num.set_valign(Gtk.Align.BASELINE)
             hero.pack_start(num, False, False, 0)
@@ -514,7 +717,7 @@ class UsageWindow(Gtk.Window):
 
         updated = ''
         for _v, _l, data in goods:
-            info = parse_tooltip(data.get('tooltip', ''), _l)
+            info = data.get('info') or parse_tooltip(data.get('tooltip', ''), _l)
             updated = info['updated'] or updated
         parts = [f'{len(results)} vendors']
         if updated:
