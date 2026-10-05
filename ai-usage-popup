@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import tomllib
@@ -238,6 +239,112 @@ def parse_tooltip(tooltip: str, vendor_label: str):
     return info
 
 
+# OpenRouter reports money, not time windows: "$0.14 of $10.00 used (1%)" for the balance and
+# "$49.86 of $50.00 remaining" for the per-key cap. Note the two phrasings mean opposite things,
+# and that the amount may be negative on an overdrawn account.
+OPENROUTER_MONEY = re.compile(r'\$(-?[\d,.]+)\s+of\s+\$(-?[\d,.]+)\s+(used|remaining)')
+
+
+API_KEY_FRAGMENT = re.compile(r'\bsk-[A-Za-z0-9._-]{2,}')
+TIER_WORD = re.compile(r'\btier\b', re.IGNORECASE)
+
+
+def redact_keys(text):
+    """Blank out anything shaped like an API key before it can reach the screen.
+
+    Skipping the tooltip's first line is a POSITIONAL guard: it holds only while the vendor keeps
+    the key on that exact line. This is the guard by content, so one extra line from the binary
+    cannot put the key back on a card.
+    """
+    return API_KEY_FRAGMENT.sub('sk-…', text)
+
+
+def openrouter_tier(tooltip):
+    """The plan pill for OpenRouter: the tier line, never the tooltip title.
+
+    The title is "OpenRouter — sk-or-v1-...", so reading it — which is what parse_tooltip() does
+    for every other vendor — would print a fragment of the API key on the card.
+    """
+    for line in strip_markup(tooltip).splitlines()[1:]:
+        # whole word: "frontier models" is OpenRouter's own vocabulary and must not pass as a tier
+        if TIER_WORD.search(line):
+            return redact_keys(line.strip())
+    return ''
+
+
+def openrouter_blank(tooltip):
+    """Info with no meters, for when the tooltip cannot be parsed.
+
+    It exists so the card never falls back to parse_tooltip() for this vendor: that fallback
+    would put the key fragment back in the plan pill.
+    """
+    return {'plan': openrouter_tier(tooltip), 'meters': [], 'extras': [], 'updated': ''}
+
+
+def openrouter_info(tooltip):
+    """Build the card info for OpenRouter, which has balances instead of windows that reset.
+
+    Returns None when the tooltip carries no usable money line, so the caller can degrade to
+    openrouter_blank() — losing detail is fine, inventing a number is not.
+    """
+    lines = strip_markup(tooltip).splitlines()
+    rows, extras, updated, pending = [], [], '', ''
+
+    # lines[0] is "OpenRouter — sk-or-v1-...", which carries a fragment of the API key: never read it
+    for line in lines[1:]:
+        m_updated = re.search(r'Updated\s+(\S+)', line)
+        if m_updated:
+            updated = redact_keys(m_updated.group(1))
+            continue
+        if TIER_WORD.search(line):
+            continue
+        m_money = OPENROUTER_MONEY.search(line)
+        if m_money:
+            # per line, so one unreadable figure costs its own meter and not the whole card:
+            # aborting the function would throw away the meters that parsed perfectly well
+            try:
+                total = float(m_money.group(2).replace(',', ''))
+                amount = float(m_money.group(1).replace(',', ''))
+            except ValueError:
+                print(f'openrouter: unreadable money line: {line.strip()!r}', file=sys.stderr)
+                pending = ''
+                continue
+            if total <= 0:
+                pending = ''
+                continue
+            # "used" gives what was spent; "remaining" gives the opposite — reading one as the
+            # other turns an untouched key into a nearly full red gauge
+            used = amount if m_money.group(3) == 'used' else total - amount
+            rows.append({
+                'name': redact_keys(pending) or f'Usage {len(rows) + 1}',
+                # from the dollars, not from the "(1%)" the tooltip rounds off. A credit can push
+                # `used` below zero; a gauge cannot go backwards, so the bar floors at empty while
+                # the note keeps the real figure.
+                'pct': max(0.0, used / total * 100),
+                'trend': '',
+                'reset': '',
+                'note': f'${total - used:,.2f} left',
+            })
+            pending = ''
+            continue
+        if re.search(r'today .*week .*month', line):
+            extras.append(redact_keys(line.strip()))
+            pending = ''
+            continue
+        if '█' in line or '░' in line:   # the bar sits between the label and its figures
+            continue
+        pending = line.strip()
+
+    if not rows:
+        return None
+    # Most spent first, so the hero is the limit that actually binds — NOT the smallest pot, which
+    # is a different thing: a $10 balance at 1% next to a $50 cap at 96% would headline the green
+    # one and hide the limit about to block every request.
+    rows.sort(key=lambda meter: meter['pct'], reverse=True)
+    return {'plan': openrouter_tier(tooltip), 'meters': rows,
+            'extras': extras, 'updated': updated}
+
+
 def fmt_pct(value):
     """Percentage for display: one decimal below 10%, integer from there up.
 
@@ -413,11 +520,29 @@ def run_vendor(vendor: str):
         out = subprocess.check_output([AI, '--vendor', vendor, '--json'],
                                       text=True, stderr=subprocess.DEVNULL, timeout=20)
         data = json.loads(out)
-        return {
+        result = {
             'text': strip_markup(str(data.get('text', ''))),
             'tooltip': str(data.get('tooltip', '')),
             'class': data.get('class', '?'),
         }
+        if vendor == 'openrouter':
+            # A parser failure here must cost detail, not the vendor: without the guard the
+            # exception would reach the except below and report a working account as unavailable.
+            # `info` is attached even when empty, ON PURPOSE: letting make_card fall back to
+            # parse_tooltip() would read the tooltip title — and the API key fragment in it — as
+            # the plan pill, which is exactly what this vendor's card must never show.
+            # openrouter_blank() is inside the guard too: it re-reads the same tooltip, so
+            # whatever broke the parser can break it as well, and the outer except would then
+            # report a working account as unavailable.
+            try:
+                result['info'] = openrouter_info(result['tooltip']) or \
+                    openrouter_blank(result['tooltip'])
+            except Exception as e:
+                # say it out loud: the silent symptom is the card quietly losing its gauges
+                print(f'openrouter: could not read the tooltip ({type(e).__name__}: {e})',
+                      file=sys.stderr)
+                result['info'] = {'plan': '', 'meters': [], 'extras': [], 'updated': ''}
+        return result
     except Exception as e:
         return {'text': 'unavailable', 'tooltip': str(e), 'class': 'critical'}
 
@@ -441,7 +566,10 @@ def offline_reason(vendor, data):
     if 'no api key' in tip or 'credentials error' in tip:
         return 'no API key', f'[{vendor}] api_key'
     first = strip_markup(data.get('tooltip') or data.get('text') or 'unavailable').splitlines()
-    return (first[0] if first else 'unavailable'), 'config.toml'
+    # This renders the tooltip's FIRST line, which for OpenRouter is "OpenRouter — sk-or-v1-…".
+    # make_card was hardened against that; this is the sibling renderer, and it reaches the screen
+    # through the "not configured" row.
+    return redact_keys(first[0] if first else 'unavailable'), 'config.toml'
 
 
 def esc(text):
@@ -556,9 +684,10 @@ class UsageWindow(Gtk.Window):
             trend.get_style_context().add_class('meter-trend')
             top.pack_start(trend, False, False, 0)
 
-        reset = Gtk.Label(label=f"⟳ {meter['reset'] or '—'}")
-        reset.get_style_context().add_class('meter-reset')
-        top.pack_end(reset, False, False, 0)
+        # A balance has no reset time; money vendors carry a `note` ("$9.86 left") in its place.
+        trailing = Gtk.Label(label=meter.get('note') or f"⟳ {meter['reset'] or '—'}")
+        trailing.get_style_context().add_class('meter-reset')
+        top.pack_end(trailing, False, False, 0)
 
         val = Gtk.Label(label=f"{fmt_pct(meter['pct'])}%")
         val.get_style_context().add_class('meter-val')
@@ -603,8 +732,11 @@ class UsageWindow(Gtk.Window):
             hero.pack_start(num, False, False, 0)
 
             ctx_lbl = Gtk.Label()
-            ctx_lbl.set_markup(f"{esc(first['name'])} · resets in "
-                               f"<span foreground='#e9ecf2' weight='bold'>{esc(first['reset'] or '—')}</span>")
+            # same split as the meter row: money says what is left, time says when it resets
+            tail = (esc(first['note']) if first.get('note')
+                    else f"resets in <span foreground='#e9ecf2' weight='bold'>"
+                         f"{esc(first['reset'] or '—')}</span>")
+            ctx_lbl.set_markup(f"{esc(first['name'])} · {tail}")
             ctx_lbl.get_style_context().add_class('hero-ctx')
             ctx_lbl.set_valign(Gtk.Align.BASELINE)
             hero.pack_start(ctx_lbl, False, False, 0)
@@ -615,7 +747,9 @@ class UsageWindow(Gtk.Window):
                 meters.pack_start(self._meter_row(meter), False, False, 0)
             card.pack_start(meters, False, False, 0)
         else:
-            fallback = Gtk.Label(label=data.get('text', 'no data'))
+            # redacted like every other tooltip-derived label: this is the one that shows
+            # when a vendor has no meters, which is exactly the degraded path
+            fallback = Gtk.Label(label=redact_keys(data.get('text', 'no data')))
             fallback.set_xalign(0)
             fallback.get_style_context().add_class('hero-ctx')
             card.pack_start(fallback, False, False, 0)
