@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.0 — 2026-10-05
+
+- OpenRouter is read as money instead of time windows. Its card now has two gauges, Balance and
+  Per-key limit, each showing what is left in dollars where a time vendor shows its reset, plus
+  today/week/month spend in the footer. It had no gauges at all before, because the vendor puts the
+  bar and the percentage on separate lines.
+- The gauges are ordered by how much is spent, so the headline figure is the limit that actually
+  binds — a balance barely touched no longer hides a cap about to block every request.
+- No fragment of an API key can reach the screen. Every label built from a vendor tooltip is
+  redacted; OpenRouter's tooltip title carries part of the key, and it used to be shown as the plan.
+- A figure the popup cannot read now costs its own gauge and says so on stderr, instead of
+  discarding the card or reporting a working account as unavailable.
+
 ## 0.1.0 — 2026-10-03
 
 First public release.
