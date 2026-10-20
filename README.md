@@ -1,10 +1,10 @@
 # AI Usage Popup
 
-A small GTK popup for Linux that shows, in one window, how much of each AI plan you have used: **Claude**, **Codex (OpenAI)**, **Z.AI**, **OpenRouter**, **DeepSeek** and **Kimi**. Each card shows the usage of every window (session, weekly…) and how long until it resets.
+A small GTK popup for Linux that shows, in one window, how much of each AI plan you have used: **Claude**, **Codex (OpenAI)**, **Z.AI**, **OpenRouter**, **DeepSeek**, **Kimi** and **Qwen**. Each card shows the usage of every window (session, weekly…) and how long until it resets.
 
 ![AI Usage Popup](docs/screenshot.png)
 
-It reads the vendors through [ai-usagebar](https://github.com/akitaonrails/ai-usagebar), the Waybar widget by Fabio Akita, so it works with the same configuration. Z.AI is the exception: the popup calls the Z.AI quota API directly, because ai-usagebar does not map the credit limits that Lite plans report.
+It reads most vendors through [ai-usagebar](https://github.com/akitaonrails/ai-usagebar), the Waybar widget by Fabio Akita, so it works with the same configuration. Two exceptions read their sources directly: Z.AI calls its quota API (ai-usagebar does not map the credit limits that Lite plans report), and Qwen shells out to Bailian's `bl usage token-plan`.
 
 ## Features
 
@@ -58,6 +58,16 @@ api_key = "your-z.ai-key"
 ```
 
 or, if it is not there, from the `ZAI_API_KEY` environment variable. Prefer the file: a desktop launcher does not see variables exported in `~/.bashrc`.
+
+For **Qwen** (Bailian Token Plan), install the Bailian CLI and log in to the console once:
+
+```bash
+npm i -g bailian-cli
+bl auth login --console
+```
+
+Until that login, the Qwen card sits under **Not configured** with `bl auth login --console` as the
+fix.
 
 ## Development
 

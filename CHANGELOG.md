@@ -2,9 +2,13 @@
 
 ## Unreleased
 
+- Qwen card: Bailian Token Plan usage (monthly percentage and reset), read through the `bl` CLI —
+  needs `npm i -g bailian-cli` plus a one-time `bl auth login --console`. Until then the card sits
+  under "Not configured" with that fix.
 - Multiple Claude accounts: every `[[anthropic.accounts]]` entry in ai-usagebar's config gets its
   own "Claude · <label>" card, queried with `--account <label>`. Cards are re-read on every
-  refresh, so adding an account to the config needs no restart.
+  refresh, so adding an account to the config needs no restart. An entry whose credentials file is
+  the default account's is skipped instead of rendering the same data twice.
 
 ## 0.2.0 — 2026-10-05
 

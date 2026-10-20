@@ -25,8 +25,15 @@ VENDORS = [
     ("openrouter", "OpenRouter"),
     ("deepseek", "DeepSeek"),
     ("kimi", "Kimi"),
+    ("qwen", "Qwen"),
 ]
 AI = shutil.which("ai-usagebar") or str(Path.home() / ".local/bin/ai-usagebar")
+
+# Qwen doesn't go through ai-usagebar (it doesn't know the vendor): the plan quota lives behind
+# Bailian's console gateway, which only the `bl` CLI reaches — the popup shells out to it the same
+# way it shells out to ai-usagebar. `bl usage token-plan` needs a ONE-TIME browser login
+# (`bl auth login --console`); the card says so when the token is missing.
+QWEN_TIMEOUT = 30
 
 # Z.AI doesn't go through ai-usagebar: the Lite plan reports CREDIT_LIMIT-type windows, and the
 # binary only maps TIME_LIMIT/TOKENS_LIMIT — the card used to sit at "0% · —" while the API had data.
@@ -538,6 +545,71 @@ def vendor_entries():
     return list(VENDORS) + extra
 
 
+def run_qwen():
+    """Reads Qwen (Bailian Token Plan) usage through the `bl` CLI."""
+    try:
+        out = subprocess.check_output(['bl', 'usage', 'token-plan', '--output', 'json'],
+                                      text=True, stderr=subprocess.DEVNULL,
+                                      timeout=QWEN_TIMEOUT,
+                                      env=qwen_env())
+    except FileNotFoundError:
+        return qwen_error('bl CLI not found (npm i -g bailian-cli)')
+    except subprocess.TimeoutExpired:
+        return qwen_error(f'timed out ({QWEN_TIMEOUT}s)')
+    except subprocess.CalledProcessError as e:
+        return qwen_error(f'bl exited {e.returncode} — run `bl auth login --console`')
+    except OSError as e:
+        return qwen_error(f'cannot run bl: {e}')
+
+    try:
+        payload = json.loads(out)
+    except (ValueError, UnicodeDecodeError):
+        return qwen_error('bl response is not JSON')
+
+    # `bl` wraps the numbers somewhere under `data`; instead of chasing its nesting, look for the
+    # keys this report carries wherever they are.
+    def find(node, key):
+        if isinstance(node, dict):
+            if isinstance(node.get(key), (int, float)) and not isinstance(node.get(key), bool):
+                return node[key]
+            for value in node.values():
+                found = find(value, key)
+                if found is not None:
+                    return found
+        elif isinstance(node, list):
+            for value in node:
+                found = find(value, key)
+                if found is not None:
+                    return found
+        return None
+
+    pct = find(payload, 'per1MonthPercentage')
+    if pct is None:
+        return qwen_error('bl reported no usage — run `bl auth login --console`')
+    return {'text': f'{fmt_pct(pct)}%', 'tooltip': '', 'class': klass_of(pct),
+            'info': {'plan': 'Token Plan',
+                     'meters': [{'name': 'Monthly', 'pct': pct, 'trend': '',
+                                 'reset': fmt_delta(find(payload, 'per1MonthResetTime'))}],
+                     'extras': ['monthly limit may be unlimited — see the Bailian console'],
+                     'updated': ''}}
+
+
+def qwen_env():
+    """PATH with nvm's bin dirs prepended: the desktop launcher doesn't inherit .bashrc, so `bl`
+    and `node` (both installed under nvm) are invisible without this."""
+    env = dict(os.environ)
+    extras = [str(d) for d in sorted(Path.home().glob('.nvm/versions/node/*/bin'))]
+    if extras:
+        env['PATH'] = ':'.join(extras) + ':' + env.get('PATH', '')
+    return env
+
+
+def qwen_error(reason):
+    """Single error contract for Qwen — same shape as zai_error, the fix names the one-time login."""
+    return {'text': 'unavailable', 'tooltip': reason, 'class': 'critical',
+            'reason': reason, 'fix': 'bl auth login --console'}
+
+
 def run_vendor(spec: str):
     if spec == 'zai':
         # The generic guard is mandatory here: this detour happens OUTSIDE the try below, and an
@@ -547,6 +619,11 @@ def run_vendor(spec: str):
             return run_zai()
         except Exception as e:
             return zai_error(f'unexpected failure: {type(e).__name__}')
+    if spec == 'qwen':
+        try:
+            return run_qwen()
+        except Exception as e:
+            return qwen_error(f'unexpected failure: {type(e).__name__}')
     try:
         # `anthropic@<label>` selects a named account from [[anthropic.accounts]]; the plain
         # vendor keeps the default account and unchanged output.
