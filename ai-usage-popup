@@ -615,7 +615,12 @@ def esc(text):
 class UsageWindow(Gtk.Window):
     def __init__(self):
         super().__init__(title='AI Usage')
-        self.set_default_size(940, 640)
+        # 940x640 cut the third row of cards; four rows of cards + header + "not configured" want
+        # ~1400. Clamp to the actual screen so a laptop display gets a maximized-feeling window
+        # instead of one taller than the monitor.
+        monitor = Gdk.Display.get_default().get_monitor(0)
+        height = min(1400, max(640, monitor.get_geometry().height - 80)) if monitor else 640
+        self.set_default_size(940, height)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_icon_name('ai-usage-popup')
         self.get_style_context().add_class('ai-window')
