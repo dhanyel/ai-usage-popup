@@ -9,6 +9,8 @@ It reads the vendors through [ai-usagebar](https://github.com/akitaonrails/ai-us
 ## Features
 
 - One card per vendor, with a gauge per usage window and the time left until each reset.
+- Multiple Claude accounts: each `[[anthropic.accounts]]` entry in ai-usagebar's config gets its
+  own **Claude · <label>** card, next to the default account's card.
 - All vendors are read in parallel; a slow or broken vendor does not hold up the others.
 - Vendors without credentials are grouped under **Not configured**, with the setting that is missing.
 - **↻ Refresh** button, and the time of the last update.
@@ -35,6 +37,18 @@ You can also run it straight from the checkout: `./ai-usage-popup`.
 ## Configuration
 
 Vendor credentials live in ai-usagebar's `~/.config/ai-usagebar/config.toml`; see its README.
+
+For a **second Claude account**, register it in that same file — ai-usagebar's "Multiple accounts"
+section has the details:
+
+```toml
+[[anthropic.accounts]]
+label = "work"
+path = "/home/you/.claude-work/.credentials.json"
+```
+
+Each entry becomes its own **Claude · work** card in the popup, refreshed together with the rest
+(no restart needed: the list is re-read on every refresh).
 
 For Z.AI, the popup reads the API key from the same file:
 

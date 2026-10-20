@@ -32,6 +32,9 @@ AI = shutil.which("ai-usagebar") or str(Path.home() / ".local/bin/ai-usagebar")
 # binary only maps TIME_LIMIT/TOKENS_LIMIT — the card used to sit at "0% · —" while the API had data.
 ZAI_URL = 'https://api.z.ai/api/monitor/usage/quota/limit'
 ZAI_CONFIG = Path.home() / '.config/ai-usagebar/config.toml'
+# Same file, read for a second purpose: the Anthropic account list. Named for what it is, not
+# for who reads it first — the extra Claude cards come from here too.
+USAGEBAR_CONFIG = ZAI_CONFIG
 ZAI_TIMEOUT = 15
 # API `unit` → (seconds per unit, label, label when number == 1). Confirmed from the resets on
 # 2026-09-04: unit 3 reset in ~4h (5-hour window) and unit 6 in 7 days (weekly).
@@ -507,8 +510,29 @@ def run_zai():
             'class': klass_of(first['pct']), 'info': info}
 
 
-def run_vendor(vendor: str):
-    if vendor == 'zai':
+def vendor_entries():
+    """(vendor_arg, card label) for every card, one per extra Anthropic account.
+
+    Each `[[anthropic.accounts]]` entry in ai-usagebar's config.toml becomes its own Claude card,
+    queried with `--account <label>`; the default account keeps the plain "Claude" card. Malformed
+    entries are skipped, not fatal — a broken account line can't take the other cards down with it.
+    Re-read on every refresh, so adding an account to the config shows up on ↻ Refresh.
+    """
+    try:
+        with USAGEBAR_CONFIG.open('rb') as fh:
+            section = tomllib.load(fh).get('anthropic')
+        accounts = section.get('accounts') if isinstance(section, dict) else None
+    except (OSError, tomllib.TOMLDecodeError):
+        accounts = None
+    extra = []
+    for acc in accounts or []:
+        if isinstance(acc, dict) and isinstance(acc.get('label'), str) and acc['label']:
+            extra.append((f'anthropic@{acc["label"]}', f'Claude · {acc["label"]}'))
+    return list(VENDORS) + extra
+
+
+def run_vendor(spec: str):
+    if spec == 'zai':
         # The generic guard is mandatory here: this detour happens OUTSIDE the try below, and an
         # exception escaping kills the pool thread — GLib.idle_add(render) never runs and the whole
         # popup freezes on "updating…", taking the other five vendors down with it.
@@ -517,8 +541,13 @@ def run_vendor(vendor: str):
         except Exception as e:
             return zai_error(f'unexpected failure: {type(e).__name__}')
     try:
-        out = subprocess.check_output([AI, '--vendor', vendor, '--json'],
-                                      text=True, stderr=subprocess.DEVNULL, timeout=20)
+        # `anthropic@<label>` selects a named account from [[anthropic.accounts]]; the plain
+        # vendor keeps the default account and unchanged output.
+        vendor, _, account = spec.partition('@')
+        args = [AI, '--vendor', vendor, '--json']
+        if account:
+            args += ['--account', account]
+        out = subprocess.check_output(args, text=True, stderr=subprocess.DEVNULL, timeout=20)
         data = json.loads(out)
         result = {
             'text': strip_markup(str(data.get('text', ''))),
@@ -814,8 +843,9 @@ class UsageWindow(Gtk.Window):
         self.subtitle.set_text('updating…')
 
         def worker():
-            with ThreadPoolExecutor(max_workers=len(VENDORS)) as pool:
-                results = list(pool.map(lambda v: (v[0], v[1], run_vendor(v[0])), VENDORS))
+            entries = vendor_entries()
+            with ThreadPoolExecutor(max_workers=len(entries)) as pool:
+                results = list(pool.map(lambda v: (v[0], v[1], run_vendor(v[0])), entries))
             GLib.idle_add(self.render, results)
 
         threading.Thread(target=worker, daemon=True).start()

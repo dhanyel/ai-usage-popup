@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Multiple Claude accounts: every `[[anthropic.accounts]]` entry in ai-usagebar's config gets its
+  own "Claude · <label>" card, queried with `--account <label>`. Cards are re-read on every
+  refresh, so adding an account to the config needs no restart.
+
 ## 0.2.0 — 2026-10-05
 
 - OpenRouter is read as money instead of time windows. Its card now has two gauges, Balance and
