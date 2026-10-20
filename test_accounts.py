@@ -61,6 +61,17 @@ class TestVendorEntries(unittest.TestCase):
             'anthropic_accounts = "wrong shape"\n')                   # wrong shape entirely
         self.assertEqual(mod.vendor_entries(), mod.VENDORS)
 
+    def test_account_pointing_at_the_default_credentials_is_skipped(self):
+        # The same data twice — once labeled "Claude", once "Claude · x" — is a duplicate card,
+        # not a second account.
+        mod.USAGEBAR_CONFIG = write_config(
+            '[[anthropic.accounts]]\nlabel = "dup"\n'
+            f'credentials_path = "{mod.Path.home() / ".claude/.credentials.json"}"\n'
+            '[[anthropic.accounts]]\nlabel = "work"\n'
+            'credentials_path = "/home/you/.claude-work/.credentials.json"\n')
+        self.assertEqual([lbl for _, lbl in mod.vendor_entries()],
+                         [lbl for _, lbl in mod.VENDORS] + ['Claude · work'])
+
 
 class TestRunVendorAccount(unittest.TestCase):
     def test_account_selects_the_named_account(self):

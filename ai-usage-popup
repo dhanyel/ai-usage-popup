@@ -514,9 +514,11 @@ def vendor_entries():
     """(vendor_arg, card label) for every card, one per extra Anthropic account.
 
     Each `[[anthropic.accounts]]` entry in ai-usagebar's config.toml becomes its own Claude card,
-    queried with `--account <label>`; the default account keeps the plain "Claude" card. Malformed
-    entries are skipped, not fatal — a broken account line can't take the other cards down with it.
-    Re-read on every refresh, so adding an account to the config shows up on ↻ Refresh.
+    queried with `--account <label>`. An entry whose credentials file IS the default account's
+    (`~/.claude/.credentials.json`) is skipped: it would render the same data twice, once labeled
+    "Claude" and once labeled "Claude · <label>" — that's a duplicate card, not a second account.
+    Malformed entries are skipped, not fatal — a broken account line can't take the other cards
+    down with it. Re-read on every refresh, so adding an account to the config shows up on ↻ Refresh.
     """
     try:
         with USAGEBAR_CONFIG.open('rb') as fh:
@@ -524,10 +526,15 @@ def vendor_entries():
         accounts = section.get('accounts') if isinstance(section, dict) else None
     except (OSError, tomllib.TOMLDecodeError):
         accounts = None
+    default_creds = (Path.home() / '.claude/.credentials.json').resolve()
     extra = []
     for acc in accounts or []:
-        if isinstance(acc, dict) and isinstance(acc.get('label'), str) and acc['label']:
-            extra.append((f'anthropic@{acc["label"]}', f'Claude · {acc["label"]}'))
+        if not (isinstance(acc, dict) and isinstance(acc.get('label'), str) and acc['label']):
+            continue
+        creds = acc.get('credentials_path')
+        if isinstance(creds, str) and creds and Path(creds).expanduser().resolve() == default_creds:
+            continue
+        extra.append((f'anthropic@{acc["label"]}', f'Claude · {acc["label"]}'))
     return list(VENDORS) + extra
 
 
