@@ -586,6 +586,11 @@ def run_qwen():
     pct = find(payload, 'per1MonthPercentage')
     if pct is None:
         return qwen_error('bl reported no usage — run `bl auth login --console`')
+    # Confirmed against the real API on 2026-10-20: 1.25% used arrives as 0.01246 — a fraction,
+    # not the 0–100 the other cards speak. A true "100%" can only arrive as 1.0 under this
+    # reading, so scaling <=1 up is safe in both worlds.
+    if pct <= 1:
+        pct *= 100
     return {'text': f'{fmt_pct(pct)}%', 'tooltip': '', 'class': klass_of(pct),
             'info': {'plan': 'Token Plan',
                      'meters': [{'name': 'Monthly', 'pct': pct, 'trend': '',

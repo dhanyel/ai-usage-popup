@@ -20,7 +20,8 @@ RESET = 1796000000000   # epoch ms, far enough ahead for a "Xd Yh" delta
 
 
 def payload(nested=True):
-    data = {'per1MonthPercentage': 12.5, 'per1MonthResetTime': RESET}
+    # the real API speaks fractions (0.0124 = 1.25% used, confirmed 2026-10-20)
+    data = {'per1MonthPercentage': 0.0124, 'per1MonthResetTime': RESET}
     return json.dumps({'data': data} if nested else data)
 
 
@@ -28,15 +29,21 @@ class TestRunQwen(unittest.TestCase):
     def test_reads_the_monthly_gauge_from_the_nested_shape(self):
         with mock.patch.object(mod.subprocess, 'check_output', return_value=payload(True)):
             result = mod.run_qwen()
-        self.assertEqual(result['text'], '12%')   # fmt_pct rounds, as on every other card
+        self.assertEqual(result['text'], '1.2%')   # fraction scaled to percent, then rounded
         self.assertEqual(result['info']['plan'], 'Token Plan')
         meter = result['info']['meters'][0]
-        self.assertEqual((meter['name'], meter['pct']), ('Monthly', 12.5))
+        self.assertEqual((meter['name'], meter['pct']), ('Monthly', 1.24))
         self.assertNotEqual(meter['reset'], '—')
 
     def test_reads_the_flat_shape_too(self):
         with mock.patch.object(mod.subprocess, 'check_output', return_value=payload(False)):
-            self.assertEqual(mod.run_qwen()['info']['meters'][0]['pct'], 12.5)
+            self.assertEqual(mod.run_qwen()['info']['meters'][0]['pct'], 1.24)
+
+    def test_percent_scale_stays_untouched(self):
+        data = {'per1MonthPercentage': 42.0, 'per1MonthResetTime': RESET}
+        with mock.patch.object(mod.subprocess, 'check_output',
+                               return_value=json.dumps({'data': data})):
+            self.assertEqual(mod.run_qwen()['info']['meters'][0]['pct'], 42.0)
 
     def test_missing_usage_says_the_login_fix_not_a_fake_number(self):
         with mock.patch.object(mod.subprocess, 'check_output',
