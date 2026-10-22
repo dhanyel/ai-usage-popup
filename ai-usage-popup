@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import tomllib
 import urllib.error
@@ -694,6 +695,35 @@ def esc(text):
     return GLib.markup_escape_text(str(text))
 
 
+def card_order_path():
+    config = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
+    return config / 'ai-usage-popup' / 'card-order.json'
+
+
+def load_card_order():
+    try:
+        saved = json.loads(card_order_path().read_text(encoding='utf-8'))
+        if not isinstance(saved, list) or not all(isinstance(v, str) for v in saved):
+            saved = []
+    except (OSError, ValueError):
+        saved = []
+    # Retain extra accounts even when temporarily unavailable; append new vendors.
+    return list(dict.fromkeys(saved + [vendor for vendor, _ in VENDORS]))
+
+
+def save_card_order(order):
+    path = card_order_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Replace atomically so an interrupted write cannot truncate the preference.
+        with tempfile.TemporaryDirectory(prefix='.card-order-', dir=path.parent) as tmp:
+            staged = Path(tmp) / 'order.json'
+            staged.write_text(json.dumps(order) + '\n', encoding='utf-8')
+            staged.replace(path)
+    except OSError as error:
+        print(f'Could not save card order: {error}', file=sys.stderr)
+
+
 class UsageWindow(Gtk.Window):
     def __init__(self):
         super().__init__(title='AI Usage')
@@ -713,6 +743,7 @@ class UsageWindow(Gtk.Window):
         Gtk.StyleContext.add_provider_for_screen(
             Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
+        self.card_order = load_card_order()
         self._build_header()
 
         scroller = Gtk.ScrolledWindow()
@@ -887,6 +918,47 @@ class UsageWindow(Gtk.Window):
             card.pack_start(foot, False, False, 0)
         return card
 
+    def draggable_card(self, vendor, label, data):
+        wrapper = Gtk.EventBox()
+        wrapper.set_visible_window(False)
+        wrapper.vendor_id = vendor
+        wrapper.add(self.make_card(label, data))
+        wrapper.set_tooltip_text('Drag to reorder')
+        targets = [Gtk.TargetEntry.new('application/x-ai-usage-card',
+                                       Gtk.TargetFlags.SAME_APP, 0)]
+        wrapper.drag_source_set(Gdk.ModifierType.BUTTON1_MASK, targets, Gdk.DragAction.MOVE)
+        wrapper.drag_dest_set(Gtk.DestDefaults.MOTION | Gtk.DestDefaults.HIGHLIGHT,
+                              targets, Gdk.DragAction.MOVE)
+        wrapper.connect('drag-drop', self._drop_card)
+        return wrapper
+
+    def _drop_card(self, target, context, _x, _y, timestamp):
+        source = Gtk.drag_get_source_widget(context)
+        valid = (source is not None and hasattr(source, 'vendor_id')
+                 and source.get_parent() == self.card_grid
+                 and target.get_parent() == self.card_grid)
+        if valid:
+            self.move_card(source.vendor_id, target.vendor_id)
+        Gtk.drag_finish(context, valid, False, timestamp)
+        return True
+
+    def move_card(self, source, target):
+        cards = {card.vendor_id: card for card in self.card_grid.get_children()}
+        if source == target or source not in cards or target not in cards:
+            return
+        visible = [vendor for vendor in self.card_order if vendor in cards]
+        destination = visible.index(target)
+        visible.remove(source)
+        visible.insert(destination, source)
+        # Keep offline vendors in their slots so a later refresh can restore them.
+        ordered = iter(visible)
+        self.card_order = [next(ordered) if vendor in cards else vendor
+                           for vendor in self.card_order]
+        for i, vendor in enumerate(visible):
+            self.card_grid.child_set_property(cards[vendor], 'left-attach', i % 2)
+            self.card_grid.child_set_property(cards[vendor], 'top-attach', i // 2)
+        save_card_order(self.card_order)
+
     def make_offline_row(self, vendor, label, data):
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         row.get_style_context().add_class('off-row')
@@ -951,12 +1023,16 @@ class UsageWindow(Gtk.Window):
         goods = [(v, l, d) for v, l, d in results if not is_bad(d)]
         bads = [(v, l, d) for v, l, d in results if is_bad(d)]
 
-        grid = Gtk.Grid()
+        for vendor, _label, _data in results:
+            if vendor not in self.card_order:
+                self.card_order.append(vendor)
+        goods.sort(key=lambda item: self.card_order.index(item[0]))
+        grid = self.card_grid = Gtk.Grid()
         grid.set_row_spacing(14)
         grid.set_column_spacing(14)
         grid.set_column_homogeneous(True)
-        for i, (_v, label, data) in enumerate(goods):
-            grid.attach(self.make_card(label, data), i % 2, i // 2, 1, 1)
+        for i, (vendor, label, data) in enumerate(goods):
+            grid.attach(self.draggable_card(vendor, label, data), i % 2, i // 2, 1, 1)
         self.body.pack_start(grid, False, False, 0)
 
         if bads:
