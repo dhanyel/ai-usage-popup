@@ -1,14 +1,25 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-10-22
 
 - Qwen card: Bailian Token Plan usage (monthly percentage and reset), read through the `bl` CLI —
   needs `npm i -g bailian-cli` plus a one-time `bl auth login --console`. Until then the card sits
-  under "Not configured" with that fix.
+  under "Not configured" with that fix. The vendor does not go through ai-usagebar, which does not
+  know it, and the console gateway refuses the `DASHSCOPE_API_KEY`.
+- The Qwen percentage is scaled from the fraction the API reports (`0.0124` = 1.25%), which used to
+  read as 0% on a plan that was already being used.
+- When the Qwen card cannot read, it says why. `bl` answers an expired console session with an error
+  body and exit code 0, so the card used to report "no usage" — a data problem — for what is a login
+  problem that dies on idle timeout every few days.
 - Multiple Claude accounts: every `[[anthropic.accounts]]` entry in ai-usagebar's config gets its
   own "Claude · <label>" card, queried with `--account <label>`. Cards are re-read on every
   refresh, so adding an account to the config needs no restart. An entry whose credentials file is
   the default account's is skipped instead of rendering the same data twice.
+- Cards can be reordered by dragging one onto another position; the rest shift along. The order is
+  saved in `~/.config/ai-usage-popup/card-order.json` and restored on reopen, and a vendor that is
+  offline keeps its slot so it comes back where it was instead of at the end.
+- The window opens tall enough for four rows of cards, clamped to the screen: 940×640 cut the third
+  row off once the vendor list grew.
 
 ## 0.2.0 — 2026-10-05
 
