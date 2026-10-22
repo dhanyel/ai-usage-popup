@@ -567,6 +567,14 @@ def run_qwen():
     except (ValueError, UnicodeDecodeError):
         return qwen_error('bl response is not JSON')
 
+    # A failed call comes back as an error body with exit code 0 (seen 2026-10-22: an expired
+    # console session), so the CalledProcessError branch never fires and the card would report
+    # the generic "no usage" instead of the reason bl actually gave.
+    error = payload.get('error') if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        reason = error.get('message') or error.get('hint') or 'bl reported an error'
+        return qwen_error(str(reason).strip())
+
     # `bl` wraps the numbers somewhere under `data`; instead of chasing its nesting, look for the
     # keys this report carries wherever they are.
     def find(node, key):

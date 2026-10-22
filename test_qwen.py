@@ -52,6 +52,34 @@ class TestRunQwen(unittest.TestCase):
         self.assertEqual(result['text'], 'unavailable')
         self.assertEqual(result['fix'], 'bl auth login --console')
 
+    def test_expired_console_session_reports_bls_own_reason(self):
+        # bl exits 0 on this one, so the reason only survives if it is read out of the body.
+        body = {'error': {'code': 3,
+                          'message': 'Console session is not logged in or has expired.',
+                          'hint': 'Run `bl auth login --console` to sign in.'}}
+        with mock.patch.object(mod.subprocess, 'check_output', return_value=json.dumps(body)):
+            result = mod.run_qwen()
+        self.assertEqual(result['text'], 'unavailable')
+        self.assertEqual(result['reason'], 'Console session is not logged in or has expired.')
+        self.assertEqual(result['fix'], 'bl auth login --console')
+
+    def test_error_body_without_message_falls_back_to_the_hint(self):
+        body = {'error': {'code': 1, 'hint': 'Run `bl auth login --console`.'}}
+        with mock.patch.object(mod.subprocess, 'check_output', return_value=json.dumps(body)):
+            self.assertEqual(mod.run_qwen()['reason'], 'Run `bl auth login --console`.')
+
+    def test_error_body_without_message_or_hint_still_degrades_loudly(self):
+        with mock.patch.object(mod.subprocess, 'check_output',
+                               return_value=json.dumps({'error': {'code': 1}})):
+            result = mod.run_qwen()
+        self.assertEqual(result['text'], 'unavailable')
+        self.assertNotIn('info', result)
+
+    def test_non_dict_error_body_does_not_hide_a_real_reading(self):
+        data = {'error': 'ignored', 'per1MonthPercentage': 0.5, 'per1MonthResetTime': RESET}
+        with mock.patch.object(mod.subprocess, 'check_output', return_value=json.dumps(data)):
+            self.assertEqual(mod.run_qwen()['info']['meters'][0]['pct'], 50.0)
+
     def test_bl_failure_names_the_login(self):
         import subprocess as sp
         with mock.patch.object(mod.subprocess, 'check_output',
