@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """GTK popup showing AI vendor usage (via ai-usagebar, and via API for Z.AI)."""
+import ctypes
+import ctypes.util
 import json
 import math
 import os
@@ -16,9 +18,19 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+# GNOME's Wayland compositor gives a native client no say over its position or stacking, so the
+# toolbar could neither be pinned to an edge nor kept above other windows. Under XWayland it can.
+# setdefault: an explicit GDK_BACKEND in the environment still wins.
+os.environ.setdefault('GDK_BACKEND', 'x11')
+
 import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, GLib, Pango
+try:
+    gi.require_version('GdkX11', '3.0')
+    from gi.repository import GdkX11
+except (ValueError, ImportError):   # a GTK build without the X11 backend
+    GdkX11 = None
 
 VENDORS = [
     ("anthropic", "Claude"),
@@ -35,6 +47,7 @@ AI = shutil.which("ai-usagebar") or str(Path.home() / ".local/bin/ai-usagebar")
 # Armed when a cycle COMPLETES, not when it starts, so a slow vendor (Z.AI 15s, Qwen 30s) cannot
 # eat its own interval.
 AUTO_REFRESH_SECONDS = 300
+TOOLBAR_HEIGHT = 64   # the one-line header plus a block's three lines, with a thin margin
 
 # Qwen doesn't go through ai-usagebar (it doesn't know the vendor): the plan quota lives behind
 # Bailian's console gateway, which only the `bl` CLI reaches — the popup shells out to it the same
@@ -145,6 +158,26 @@ button.refresh:disabled { color: #5c6472; }
 .dot.critical { background-color: #ef5350; }
 .dot.unknown { background-color: #8b93a7; }
 .dot { border-radius: 99px; }
+
+/* Compact strip mode: one block per vendor, side by side. Each meter line carries its own status
+   dot as a bullet glyph (U+25CF), round by definition; an empty Label with a CSS background would
+   reserve a text line's height and render as a vertical pill. Colors mirror .dot.<class>. */
+.strip { }
+.toolbar { background: #15171c; }
+.oneline { color: #c9cdd6; font-size: 12px; }
+button.info { background: rgba(97,175,239,0.12); color: #61afef;
+              border: 1px solid rgba(97,175,239,0.28); border-radius: 6px; padding: 2px 10px;
+              font-family: monospace; font-weight: bold; }
+.block { padding: 2px 14px; }
+.block + .block { border-left: 1px solid #2a3040; }
+.mdot { font-size: 7px; margin-right: 5px; }
+.mdot.low { color: #98c379; }
+.mdot.mid { color: #e5c07b; }
+.mdot.high { color: #ff8a5c; }
+.mdot.critical { color: #ef5350; }
+.mdot.unknown { color: #8b93a7; }
+.vname { color: #c9cdd6; font-size: 12px; font-weight: 600; }
+.vline { color: #8b93a7; font-family: monospace; font-size: 11px; }
 
 .hero-num { color: #e9ecf2; font-family: monospace; font-weight: bold; font-size: 38px; }
 .hero-pct { color: #8b93a7; font-family: monospace; font-weight: bold; font-size: 22px; }
@@ -403,6 +436,38 @@ def fmt_countdown(seconds):
     total = max(0, math.ceil(seconds))
     minutes, secs = divmod(total, 60)
     return f'next in {minutes}:{secs:02d}'
+
+
+def fmt_meter_line(meter):
+    """One strip line: `Name · NN% · tail`. The tail is the meter's `note` when it has one — money
+    meters carry the dollars there and leave `reset` empty — else a usable `reset`. Absent pieces
+    are skipped, never rendered as None."""
+    parts = [meter.get('name') or '']
+    pct = meter.get('pct')
+    if isinstance(pct, (int, float)) and not isinstance(pct, bool):
+        parts.append(f'{int(round(pct))}%')
+    tail = meter.get('note') or meter.get('reset')
+    if tail and tail != '—':
+        parts.append(str(tail))
+    return ' · '.join(p for p in parts if p)
+
+
+def pick_strip_meters(info):
+    """(window, weekly) for a strip block. `window` is the first meter; `weekly` is the first meter
+    named like a week (never "Fable weekly"), else — and only for OpenRouter's money pair, in either
+    order, since the parser sorts by pct — the other of Balance/Per-key limit. Anything else has no
+    third line. Missing or empty meters degrade to (None, None) without raising."""
+    meters = (info or {}).get('meters') or []
+    if not meters:
+        return (None, None)
+    window = meters[0]
+    weekly = next((m for m in meters
+                   if 'week' in (m.get('name') or '').lower()
+                   and 'fable' not in (m.get('name') or '').lower()), None)
+    if weekly is None and len(meters) > 1:
+        if {meters[0].get('name'), meters[1].get('name')} == {'Balance', 'Per-key limit'}:
+            weekly = meters[1]
+    return (window, weekly)
 
 
 def zai_api_key():
@@ -751,15 +816,126 @@ def save_card_order(order):
         print(f'Could not save card order: {error}', file=sys.stderr)
 
 
+def mode_path():
+    config = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
+    return config / 'ai-usage-popup' / 'mode.json'
+
+
+def load_mode():
+    try:
+        saved = json.loads(mode_path().read_text(encoding='utf-8'))
+        mode = saved.get('mode') if isinstance(saved, dict) else None
+    except (OSError, ValueError):
+        mode = None
+    if mode == 'strip':   # legacy value from the pre-toolbar prototype
+        mode = 'toolbar'
+    # Anything but the two known modes is treated as the default, so a hand-edited or half-written
+    # file can never strand the popup in a state it cannot render.
+    return mode if mode in ('cards', 'toolbar') else 'cards'
+
+
+def save_mode(mode):
+    path = mode_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='.mode-', dir=path.parent) as tmp:
+            staged = Path(tmp) / 'mode.json'
+            staged.write_text(json.dumps({'mode': mode}) + '\n', encoding='utf-8')
+            staged.replace(path)
+    except OSError as error:
+        print(f'Could not save mode: {error}', file=sys.stderr)
+
+
+def bottom_strut(root_height, x, width, bottom, height):
+    """_NET_WM_STRUT_PARTIAL that reserves `height` px above `bottom` across [x, x+width). The
+    bottom value counts from the edge of the whole root window, not of the monitor."""
+    return [0, 0, 0, root_height - bottom + height, 0, 0, 0, 0, 0, 0, x, x + width - 1]
+
+
+_XA_CARDINAL = 6
+
+
+def _xlib():
+    """libX11 through ctypes: GTK3 has no API for struts, and this avoids a new dependency."""
+    name = ctypes.util.find_library('X11')
+    if not name:
+        return None
+    x = ctypes.CDLL(name)
+    vp, ul = ctypes.c_void_p, ctypes.c_ulong
+    x.XOpenDisplay.restype = vp
+    x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x.XInternAtom.restype = ul
+    x.XInternAtom.argtypes = [vp, ctypes.c_char_p, ctypes.c_int]
+    x.XChangeProperty.argtypes = [vp, ul, ul, ul, ctypes.c_int, ctypes.c_int, vp, ctypes.c_int]
+    x.XGetWindowProperty.argtypes = [vp, ul, ul, ctypes.c_long, ctypes.c_long, ctypes.c_int, ul,
+                                     ctypes.POINTER(ul), ctypes.POINTER(ctypes.c_int),
+                                     ctypes.POINTER(ul), ctypes.POINTER(ul), ctypes.POINTER(vp)]
+    x.XFree.argtypes = [vp]
+    x.XFlush.argtypes = [vp]
+    x.XCloseDisplay.argtypes = [vp]
+    return x
+
+
+def _x11_target(gdk_window):
+    """(xlib, display, xid) for an X11 GdkWindow, else None — a native Wayland window has no
+    struts to set."""
+    if gdk_window is None or GdkX11 is None or not isinstance(gdk_window, GdkX11.X11Window):
+        return None
+    x = _xlib()
+    if x is None:
+        return None
+    display = x.XOpenDisplay(gdk_window.get_display().get_name().encode())
+    if not display:
+        return None
+    return x, display, gdk_window.get_xid()
+
+
+def write_strut(gdk_window, values):
+    target = _x11_target(gdk_window)
+    if target is None:
+        return
+    x, display, xid = target
+    try:
+        data = (ctypes.c_long * 12)(*values)
+        partial = x.XInternAtom(display, b'_NET_WM_STRUT_PARTIAL', 0)
+        x.XChangeProperty(display, xid, partial, _XA_CARDINAL, 32, 0, data, 12)
+        legacy = x.XInternAtom(display, b'_NET_WM_STRUT', 0)
+        x.XChangeProperty(display, xid, legacy, _XA_CARDINAL, 32, 0, data, 4)
+        x.XFlush(display)
+    finally:
+        x.XCloseDisplay(display)
+
+
+def read_strut(gdk_window):
+    """The window's _NET_WM_STRUT_PARTIAL as a list, or None when it has none."""
+    target = _x11_target(gdk_window)
+    if target is None:
+        return None
+    x, display, xid = target
+    try:
+        atom = x.XInternAtom(display, b'_NET_WM_STRUT_PARTIAL', 0)
+        kind, fmt = ctypes.c_ulong(), ctypes.c_int()
+        count, after, prop = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_void_p()
+        x.XGetWindowProperty(display, xid, atom, 0, 12, 0, _XA_CARDINAL, ctypes.byref(kind),
+                             ctypes.byref(fmt), ctypes.byref(count), ctypes.byref(after),
+                             ctypes.byref(prop))
+        if not prop.value:
+            return None
+        try:
+            return list(ctypes.cast(prop, ctypes.POINTER(ctypes.c_long))[:count.value]) or None
+        finally:
+            x.XFree(prop)
+    finally:
+        x.XCloseDisplay(display)
+
+
 class UsageWindow(Gtk.Window):
     def __init__(self):
         super().__init__(title='AI Usage')
         # 940x640 cut the third row of cards; four rows of cards + header + "not configured" want
         # ~1400. Clamp to the actual screen so a laptop display gets a maximized-feeling window
-        # instead of one taller than the monitor.
-        monitor = Gdk.Display.get_default().get_monitor(0)
-        height = min(1400, max(640, monitor.get_geometry().height - 80)) if monitor else 640
-        self.set_default_size(940, height)
+        # instead of one taller than the monitor. The strip mode is short, so the height is applied
+        # later, once the mode is known (see _apply_size).
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_icon_name('ai-usage-popup')
         self.get_style_context().add_class('ai-window')
@@ -775,7 +951,15 @@ class UsageWindow(Gtk.Window):
         self._next_refresh = None
         self._refreshing = False
         self._subtitle_base = ''
+        # The cache must exist before the header is built: the mode button can be clicked while the
+        # first (asynchronous) collection is still in flight.
+        self._last_results = None
+        self.mode = load_mode()
         self._build_header()
+        self._apply_presentation()
+        # Every toggle unrealizes the window, so each realize is a new X window: the toolbar's
+        # reserves its strip there, and a cards window simply never gets one.
+        self.connect_after('realize', lambda _w: self._reserve_strip())
 
         scroller = Gtk.ScrolledWindow()
         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -792,6 +976,11 @@ class UsageWindow(Gtk.Window):
 
     # ── construction ───────────────────────────────────────────
     def _build_header(self):
+        # The HeaderBar is the window's titlebar, so it only exists while the window is decorated —
+        # i.e. in cards mode. The toolbar is undecorated, so its controls (the i button and the
+        # one-line header) live in the body instead; they are created here, parentless, so
+        # _set_subtitle and _toggle_mode keep stable references and _render_strip reparents them
+        # into the bar.
         header = Gtk.HeaderBar()
         header.set_show_close_button(True)
         header.get_style_context().add_class('ai-header')
@@ -812,6 +1001,7 @@ class UsageWindow(Gtk.Window):
         self.subtitle.get_style_context().add_class('win-sub')
         titles.pack_start(title, False, False, 0)
         titles.pack_start(self.subtitle, False, False, 0)
+        self.titles = titles
         title_box.pack_start(titles, False, False, 0)
 
         header.set_custom_title(None)
@@ -821,6 +1011,20 @@ class UsageWindow(Gtk.Window):
         self.refresh_btn.get_style_context().add_class('refresh')
         self.refresh_btn.connect('clicked', lambda _b: self.refresh())
         header.pack_end(self.refresh_btn)
+
+        self.mode_btn = Gtk.Button()
+        self.mode_btn.get_style_context().add_class('refresh')
+        self.mode_btn.connect('clicked', lambda _b: self._toggle_mode())
+        header.pack_end(self.mode_btn)
+
+        self.oneline_label = Gtk.Label(label='')
+        self.oneline_label.set_xalign(0)
+        self.oneline_label.get_style_context().add_class('oneline')
+        self.cards_btn = Gtk.Button.new_with_label('i')
+        self.cards_btn.get_style_context().add_class('info')
+        self.cards_btn.set_tooltip_text('Open the card view')
+        self.cards_btn.connect('clicked', lambda _b: self._toggle_mode())
+        self._update_mode_button()
 
     def _badge(self, klass):
         if klass not in ('low', 'mid', 'high', 'critical'):
@@ -1041,7 +1245,7 @@ class UsageWindow(Gtk.Window):
     def refresh(self):
         self._refreshing = True
         self.refresh_btn.set_sensitive(False)
-        self.subtitle.set_text('updating…')
+        self._set_subtitle('updating…')
 
         def worker():
             entries = vendor_entries()
@@ -1050,6 +1254,13 @@ class UsageWindow(Gtk.Window):
             GLib.idle_add(self.render, results)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _set_subtitle(self, text):
+        """One place that owns the subtitle text. The toolbar's single line mirrors it
+        unconditionally, so `updating…`, the stamp and the per-second countdown all reach both
+        layouts regardless of which is currently visible."""
+        self.subtitle.set_text(text)
+        self.oneline_label.set_text(f'AI Usage · {text}')
 
     def _tick(self):
         """Once a second: repaint the countdown, and refresh when it reaches zero.
@@ -1071,34 +1282,111 @@ class UsageWindow(Gtk.Window):
         # Empty base means the first render has not landed yet; the label still says `loading…`
         # and a countdown appended to it would be noise about a cycle nobody has seen.
         if self._subtitle_base:
-            self.subtitle.set_text(f'{self._subtitle_base} · {fmt_countdown(remaining)}')
+            self._set_subtitle(f'{self._subtitle_base} · {fmt_countdown(remaining)}')
+
+    def _primary_geometry(self):
+        display = Gdk.Display.get_default()
+        monitor = display.get_primary_monitor() or display.get_monitor(0)
+        return monitor.get_geometry() if monitor else None
+
+    def _toolbar_span(self):
+        """(x, width, bottom) for the toolbar. The bottom edge: at the top the bar sat under
+        GNOME's panel. x and width come from the work area, which keeps it clear of the dock on the
+        left; the bottom comes from the MONITOR, because the work area shrinks by the bar's own
+        strut and would push it up by its height on every toggle."""
+        geo, area = self._primary_geometry(), self._primary_workarea()
+        if geo is None or area is None:
+            return 0, 1280, 800
+        return area.x, area.width, geo.y + geo.height
+
+    def _reserve_strip(self):
+        """Toolbar only: ask the WM to keep maximized windows out of the bar's strip — without it
+        the bar covered the bottom of maximized windows, e.g. Discord's message box."""
+        if self.mode != 'toolbar':
+            return
+        x, width, bottom = self._toolbar_span()
+        root_height = self.get_screen().get_root_window().get_height()
+        write_strut(self.get_window(), bottom_strut(root_height, x, width, bottom, TOOLBAR_HEIGHT))
+
+    def _primary_workarea(self):
+        """The primary monitor minus what the shell reserves: GNOME's top panel, the Ubuntu dock."""
+        display = Gdk.Display.get_default()
+        monitor = display.get_primary_monitor() or display.get_monitor(0)
+        return monitor.get_workarea() if monitor else None
+
+    def _apply_presentation(self):
+        """One place that makes the window look like its mode: the toolbar is undecorated,
+        keep-above and pinned to the bottom edge of the primary monitor's work area, at its full
+        width; cards is a decorated,
+        centered, tall window. It only takes full effect on a window that is not realized yet —
+        _toggle_mode unmaps and unrealizes before calling it, so each switch is a fresh start."""
+        geo = self._primary_geometry()
+        if self.mode == 'toolbar':
+            # DOCK makes the WM treat the bar as a panel: no decoration, no maximize, stays where it
+            # is placed. A plain borderless window as wide as the screen gets maximized by mutter
+            # (the bug seen on GNOME: the bar filled the screen with its body below).
+            self.set_type_hint(Gdk.WindowTypeHint.DOCK)
+            self.set_decorated(False)
+            self.set_keep_above(True)
+            self.unmaximize()
+            x, width, bottom = self._toolbar_span()
+            self.move(x, bottom - TOOLBAR_HEIGHT)
+            self.resize(width, TOOLBAR_HEIGHT)
+        else:
+            self.set_type_hint(Gdk.WindowTypeHint.NORMAL)
+            self.unmaximize()
+            self.set_decorated(True)
+            self.set_keep_above(False)
+            self.set_position(Gtk.WindowPosition.CENTER)
+            screen_h = geo.height if geo else 800
+            self.resize(940, min(1400, max(640, screen_h - 80)))
+
+    def _update_mode_button(self):
+        # Visibility is structural, not toggled: cards shows the HeaderBar (titles + mode_btn +
+        # Refresh), the toolbar shows the body bar (i button + one-line header + blocks). Only the
+        # label and the one-line text need updating here.
+        if self.mode == 'toolbar':
+            # Sync the one-line header with whatever the subtitle currently says, so entering the
+            # toolbar mid-collection shows `updating…` instead of stale or empty text.
+            self.oneline_label.set_text(f'AI Usage · {self.subtitle.get_text()}')
+            self.mode_btn.set_label('▦ Cards')
+            self.mode_btn.set_tooltip_text('Switch to the card grid')
+        else:
+            self.mode_btn.set_label('📌 Toolbar')
+            self.mode_btn.set_tooltip_text('Pin as an always-on-top toolbar')
+
+    def _toggle_mode(self):
+        """Visual-only switch: flip the mode, persist it, re-present the window, and rebuild from
+        the cached results. It deliberately touches neither the countdown/_next_refresh nor the
+        in-flight state, so alternating presentations never postpones the next refresh or ends a
+        collection early."""
+        self.mode = 'toolbar' if self.mode == 'cards' else 'cards'
+        save_mode(self.mode)
+        self._update_mode_button()
+        # The compositor only honours the DOCK hint, the undecorated frame and the top-edge
+        # placement when a window is MAPPED with them; changing them on a window already on screen
+        # was ignored (Wayland: the bar kept the cards' position and came out 46px tall, clipping
+        # its lines; X11: mutter kept it a normal 1238x1020 window). Unmapping first makes every
+        # switch look like a fresh start in that mode.
+        mapped = self.get_mapped()
+        if mapped:
+            self.hide()
+        # Unrealizing too drops the GdkWindow, so the next show() creates it from scratch, exactly
+        # as at startup. Re-presenting a still-realized window made GTK3 add the old client-side
+        # frame (shadow + titlebar) to the new size: the toolbar came back 46px tall.
+        self.unrealize()
+        self._apply_presentation()
+        # Before the first collection lands there is nothing to rebuild; render() will do it.
+        if self._last_results is not None:
+            self._rebuild(self._last_results)
+        if mapped:
+            self.show()
 
     def render(self, results):
-        for child in self.body.get_children():
-            self.body.remove(child)
-
+        """Collection COMPLETED. The only place that updates the subtitle, re-arms the countdown,
+        clears the in-flight flag and re-enables Refresh — then delegates the body to _rebuild."""
+        self._last_results = results
         goods = [(v, l, d) for v, l, d in results if not is_bad(d)]
-        bads = [(v, l, d) for v, l, d in results if is_bad(d)]
-
-        for vendor, _label, _data in results:
-            if vendor not in self.card_order:
-                self.card_order.append(vendor)
-        goods.sort(key=lambda item: self.card_order.index(item[0]))
-        grid = self.card_grid = Gtk.Grid()
-        grid.set_row_spacing(14)
-        grid.set_column_spacing(14)
-        grid.set_column_homogeneous(True)
-        for i, (vendor, label, data) in enumerate(goods):
-            grid.attach(self.draggable_card(vendor, label, data), i % 2, i // 2, 1, 1)
-        self.body.pack_start(grid, False, False, 0)
-
-        if bads:
-            self.body.pack_start(self._section_label('Not configured', len(bads)), False, False, 0)
-            off_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-            for vendor, label, data in bads:
-                off_box.pack_start(self.make_offline_row(vendor, label, data), False, False, 0)
-            self.body.pack_start(off_box, False, False, 0)
-
         updated = ''
         for _v, _l, data in goods:
             info = data.get('info') or parse_tooltip(data.get('tooltip', ''), _l)
@@ -1112,10 +1400,117 @@ class UsageWindow(Gtk.Window):
         self._next_refresh = time.monotonic() + self.auto_refresh
         self._refreshing = False
         self._paint_countdown(self.auto_refresh)
-
         self.refresh_btn.set_sensitive(True)
-        self.body.show_all()
+        self._rebuild(results)
         return False
+
+    def _rebuild(self, results):
+        """Reconstruct the body for the current mode. Classification and ordering live HERE so
+        render() and a mode toggle share one contract; no completion effects (subtitle, timer,
+        in-flight flag, Refresh button) belong here. Shared body properties are set in BOTH
+        branches, so cards→strip→cards restores the card layout."""
+        # The i button and the single line outlive every bar they are reparented into. Detach them
+        # BEFORE the old bar goes: a GtkContainer that is dropped destroys the children still inside
+        # it, and a destroyed button loses its 'clicked' handler — on the second cards→toolbar trip
+        # the button did nothing. Our own reference keeps them alive while they have no parent.
+        for widget in (self.cards_btn, self.oneline_label):
+            parent = widget.get_parent()
+            if parent is not None:
+                parent.remove(widget)
+        for child in self.body.get_children():
+            self.body.remove(child)
+
+        goods = [(v, l, d) for v, l, d in results if not is_bad(d)]
+        bads = [(v, l, d) for v, l, d in results if is_bad(d)]
+        for vendor, _label, _data in results:
+            if vendor not in self.card_order:
+                self.card_order.append(vendor)
+        goods.sort(key=lambda item: self.card_order.index(item[0]))
+
+        if self.mode == 'toolbar':
+            self.body.set_border_width(2)
+            self.body.set_spacing(0)
+            self._render_strip(goods)
+        else:
+            self.body.set_border_width(18)
+            self.body.set_spacing(18)
+            grid = self.card_grid = Gtk.Grid()
+            grid.set_row_spacing(14)
+            grid.set_column_spacing(14)
+            grid.set_column_homogeneous(True)
+            for i, (vendor, label, data) in enumerate(goods):
+                grid.attach(self.draggable_card(vendor, label, data), i % 2, i // 2, 1, 1)
+            self.body.pack_start(grid, False, False, 0)
+            if bads:
+                self.body.pack_start(self._section_label('Not configured', len(bads)), False, False, 0)
+                off_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+                for vendor, label, data in bads:
+                    off_box.pack_start(self.make_offline_row(vendor, label, data), False, False, 0)
+                self.body.pack_start(off_box, False, False, 0)
+        self.body.show_all()
+
+    @staticmethod
+    def _reparent(widget, box):
+        parent = widget.get_parent()
+        if parent is not None:
+            parent.remove(widget)
+        box.pack_start(widget, False, False, 0)
+
+    def _render_strip(self, goods):
+        """The toolbar body: one horizontal bar with the i button, the glyph, the one-line header
+        and one compact block per configured vendor — no "Not configured" section. The i button
+        and the one-line label live here (not in the HeaderBar) because an undecorated window has
+        no titlebar. ai-usagebar vendors carry no `info`; their windows come from the tooltip,
+        the same fallback the card uses — without it Claude/Codex would render empty."""
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        bar.get_style_context().add_class('strip')
+        bar.get_style_context().add_class('toolbar')
+        bar.set_border_width(2)
+
+        self._reparent(self.cards_btn, bar)
+        glyph = Gtk.Label(label='ai')
+        glyph.get_style_context().add_class('app-glyph')
+        bar.pack_start(glyph, False, False, 0)
+        self._reparent(self.oneline_label, bar)
+        bar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 4)
+
+        for vendor, label, data in goods:
+            block = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            block.get_style_context().add_class('block')
+
+            top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+            name = Gtk.Label(label=label)
+            name.set_xalign(0)
+            name.get_style_context().add_class('vname')
+            top.pack_start(name, False, False, 0)
+            block.pack_start(top, False, False, 0)
+
+            info = data.get('info') or parse_tooltip(data.get('tooltip', ''), label)
+            window, weekly = pick_strip_meters(info)
+            for meter in (window, weekly):
+                if meter is None:
+                    continue
+                # One status dot per meter line, not per vendor: each meter has its own usage, so
+                # a single vendor color would hide e.g. a calm session next to a 92% weekly.
+                pct = meter.get('pct')
+                row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+                # A ● glyph, not a painted shape: an empty Label reserves a text line's height
+                # (18px) and turns a background dot into a vertical pill, DrawingArea/Box paint no
+                # CSS background in this GTK3 build, and a cairo draw handler needs python3-gi-cairo,
+                # which this box lacks. The glyph is round by definition and colored via CSS.
+                dot = Gtk.Label(label='●')
+                dot.set_valign(Gtk.Align.CENTER)
+                dot.get_style_context().add_class('mdot')
+                dot.get_style_context().add_class(klass_of(pct) if pct is not None else 'unknown')
+                row.pack_start(dot, False, False, 0)
+                line = Gtk.Label(label=fmt_meter_line(meter))
+                line.set_xalign(0)
+                line.get_style_context().add_class('vline')
+                row.pack_start(line, False, False, 0)
+                block.pack_start(row, False, False, 0)
+
+            bar.pack_start(block, False, False, 0)
+        self.body.pack_start(bar, False, False, 0)
 
 
 if __name__ == '__main__':

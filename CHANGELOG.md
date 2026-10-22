@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.9.0 — 2026-10-22
+
+- A **toolbar** presentation: the usage as a thin, undecorated, always-on-top bar pinned to the
+  bottom edge of the screen at full width — one compact block per vendor, side by side, no "Not
+  configured" section — for leaving it always visible like a taskbar. An **i** button opens the
+  card view, and a 📌 button in the cards view pins the bar again; the choice is remembered.
+- The bar reserves its strip through `_NET_WM_STRUT_PARTIAL`, so maximized windows stop above it
+  instead of sliding under it, and the app runs under XWayland (`GDK_BACKEND=x11`), because a
+  native Wayland client gets no say over its position or stacking.
+- Each block shows three lines: the vendor, its window quota and its weekly quota. Claude drops its
+  "Fable weekly" meter; a vendor with no weekly window (Qwen) shows two lines; OpenRouter shows its
+  Balance and Per-key limit. Each meter line carries its own tiny status dot (green to red by that
+  meter's usage), so one block can show a calm session next to a hot weekly. The toolbar's header
+  is a single line (title, stamp and countdown).
+- Switching between the toolbar and the cards never re-reads the vendors and never disturbs the
+  automatic refresh.
+
 ## 0.3.1 — 2026-10-22
 
 - Automatic refresh every 5 minutes, for every vendor, through the same path the ↻ Refresh button
