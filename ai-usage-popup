@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """GTK popup showing AI vendor usage (via ai-usagebar, and via API for Z.AI)."""
 import json
+import math
 import os
 import re
 import shutil
@@ -29,6 +30,11 @@ VENDORS = [
     ("qwen", "Qwen"),
 ]
 AI = shutil.which("ai-usagebar") or str(Path.home() / ".local/bin/ai-usagebar")
+
+# One automatic cycle re-reads EVERY vendor, through the same path the ↻ Refresh button uses.
+# Armed when a cycle COMPLETES, not when it starts, so a slow vendor (Z.AI 15s, Qwen 30s) cannot
+# eat its own interval.
+AUTO_REFRESH_SECONDS = 300
 
 # Qwen doesn't go through ai-usagebar (it doesn't know the vendor): the plan quota lives behind
 # Bailian's console gateway, which only the `bl` CLI reaches — the popup shells out to it the same
@@ -384,6 +390,19 @@ def fmt_delta(ms_epoch):
     if hours:
         return f'{hours}h {minutes}m'
     return f'{minutes}m'
+
+
+def fmt_countdown(seconds):
+    """Time until the next automatic refresh, as `next in M:SS`.
+
+    Ceil, not floor or round: the window opens reading 5:00, and the refresh fires when the count
+    reaches zero. Flooring would show 0:00 for a whole second while the read is already late.
+    No hour unit on purpose — the interval is minutes, and 60:00 is honest where 1:00:00 would
+    invent a precision the header has no room for.
+    """
+    total = max(0, math.ceil(seconds))
+    minutes, secs = divmod(total, 60)
+    return f'next in {minutes}:{secs:02d}'
 
 
 def zai_api_key():
@@ -752,6 +771,10 @@ class UsageWindow(Gtk.Window):
             Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
         self.card_order = load_card_order()
+        self.auto_refresh = AUTO_REFRESH_SECONDS
+        self._next_refresh = None
+        self._refreshing = False
+        self._subtitle_base = ''
         self._build_header()
 
         scroller = Gtk.ScrolledWindow()
@@ -762,6 +785,9 @@ class UsageWindow(Gtk.Window):
         self.body.set_border_width(18)
         scroller.add(self.body)
 
+        # One tick drives both the countdown and the automatic refresh; it lives as long as the
+        # window does, so it returns True forever and is never removed.
+        GLib.timeout_add_seconds(1, self._tick)
         self.refresh()
 
     # ── construction ───────────────────────────────────────────
@@ -1013,6 +1039,7 @@ class UsageWindow(Gtk.Window):
 
     # ── data ───────────────────────────────────────────────────
     def refresh(self):
+        self._refreshing = True
         self.refresh_btn.set_sensitive(False)
         self.subtitle.set_text('updating…')
 
@@ -1023,6 +1050,28 @@ class UsageWindow(Gtk.Window):
             GLib.idle_add(self.render, results)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _tick(self):
+        """Once a second: repaint the countdown, and refresh when it reaches zero.
+
+        A cycle already in flight is left alone — the subtitle reads `updating…` and repainting a
+        countdown over it would show time remaining on a read that has not finished, while firing a
+        second refresh would stack requests on vendors whose timeouts run to 30s.
+        """
+        if self._refreshing or self._next_refresh is None:
+            return True
+        remaining = self._next_refresh - time.monotonic()
+        if remaining <= 0:
+            self.refresh()
+        else:
+            self._paint_countdown(remaining)
+        return True
+
+    def _paint_countdown(self, remaining):
+        # Empty base means the first render has not landed yet; the label still says `loading…`
+        # and a countdown appended to it would be noise about a cycle nobody has seen.
+        if self._subtitle_base:
+            self.subtitle.set_text(f'{self._subtitle_base} · {fmt_countdown(remaining)}')
 
     def render(self, results):
         for child in self.body.get_children():
@@ -1057,7 +1106,12 @@ class UsageWindow(Gtk.Window):
         parts = [f'{len(results)} vendors']
         if updated:
             parts.insert(0, f'updated at {updated}')
-        self.subtitle.set_text(' · '.join(parts))
+        self._subtitle_base = ' · '.join(parts)
+        # Armed here, on completion: the manual ↻ Refresh ends in this same method, so it rearms
+        # the countdown by itself and is never followed one second later by an automatic cycle.
+        self._next_refresh = time.monotonic() + self.auto_refresh
+        self._refreshing = False
+        self._paint_countdown(self.auto_refresh)
 
         self.refresh_btn.set_sensitive(True)
         self.body.show_all()

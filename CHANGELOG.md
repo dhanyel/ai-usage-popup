@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1 — 2026-10-22
+
+- Automatic refresh every 5 minutes, for every vendor, through the same path the ↻ Refresh button
+  uses. A countdown next to the last-update stamp (`updated at HH:MM · N vendors · next in M:SS`)
+  shows how long until the next cycle, so a window left open no longer silently goes stale.
+- The countdown is armed when a cycle completes, not when it starts, so a slow vendor (Z.AI 15s,
+  Qwen 30s) cannot eat its own interval, and a manual refresh re-arms it instead of being followed
+  one second later by an automatic one. While a cycle is in flight the countdown is hidden — the
+  header already says `updating…`.
+
 ## 0.3.0 — 2026-10-22
 
 - Qwen card: Bailian Token Plan usage (monthly percentage and reset), read through the `bl` CLI —
